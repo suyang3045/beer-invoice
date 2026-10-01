@@ -59,7 +59,7 @@ def load_products():
 
 @st.cache_data(ttl=600)
 def load_prices():
-    return q("SELECT apply_date, product_name, dest, price FROM unit_prices")
+    return q("SELECT apply_date, product_code, product_name, dest, price FROM unit_prices")
 
 
 @st.cache_data(ttl=60)
@@ -81,6 +81,16 @@ def lookup_price(prices, name, dest, d: date):
     if m.empty:
         return None
     return float(m.sort_values("apply_date").iloc[-1]["price"])
+
+
+def current_product_labels(prices, d: date):
+    """작성일자 기준 가장 최근 적용일자의 단가표에 있는 제품만 (단종·이름 바뀐 옛 제품 제외)."""
+    valid = prices[prices.apply_date <= d.isoformat()]
+    if valid.empty:
+        return []
+    cur = valid[valid.apply_date == valid.apply_date.max()]
+    cur = cur.dropna(subset=["product_code"]).drop_duplicates(["product_code", "product_name"])
+    return [f"{c} - {n}" for c, n in sorted(zip(cur.product_code, cur.product_name))]
 
 
 def previous_unpaid(partner_name, d: date):
@@ -192,7 +202,8 @@ def page_entry():
 
     # 제품 입력
     st.subheader("제품")
-    product_labels = [f"{r.product_code} - {r.product_name}" for r in products.itertuples()]
+    product_labels = current_product_labels(prices, inv_date) or \
+        [f"{r.product_code} - {r.product_name}" for r in products.itertuples()]
     if product_type == "용기":  # 용기는 201로 시작하는 코드를 먼저 보여 준다
         product_labels.sort(key=lambda l: (not l.startswith(CONTAINER_PREFIX), l))
     ver = st.session_state.setdefault("editor_ver", 0)
@@ -326,7 +337,7 @@ def edit_invoice(serial, inv):
                FROM invoice_items WHERE serial_no = :s ORDER BY id""", s=serial)
     old_label = [f"{_s(r.product_code)} - {_s(r.product_name)}" for r in old.itertuples()]
     old_price = dict(zip(old_label, old["unit_price"]))
-    options = [f"{r.product_code} - {r.product_name}" for r in load_products().itertuples()]
+    options = current_product_labels(load_prices(), new_date)
     options += [l for l in old_label if l not in options]
 
     st.caption("제품과 수량만 고칠 수 있습니다. 저장된 제품의 단가는 그대로 유지되고, 새로 추가한 제품만 단가표에서 자동 적용됩니다.")
@@ -680,9 +691,9 @@ def price_change_judgement(fuel_map):
     # 3) 새 단가 미리보기
     st.subheader("③ 새 단가 미리보기")
     st.caption("새 단가는 소수 둘째 자리까지 계산합니다 (셋째 자리에서 반올림).")
-    latest = (prices[prices["apply_date"] < apply_date.isoformat()]
-              .sort_values("apply_date")
-              .groupby(["product_name", "dest"], as_index=False).last())
+    # 직전 적용일자의 단가표(현재 단가)만 대상 — 옛날에 끝난 제품·이름이 바뀐 제품은 제외
+    before = prices[prices["apply_date"] < apply_date.isoformat()]
+    latest = before[before["apply_date"] == before["apply_date"].max()].drop_duplicates(["product_name", "dest"])
     latest["새단가"] = [round_price(p * (1 + rate)) for p in latest["price"]]
     latest["차이"] = latest["새단가"] - latest["price"]
     view = latest.rename(columns={"product_code": "제품코드", "product_name": "제품명", "dest": "도착지",
@@ -797,8 +808,10 @@ def page_price_table():
         view = f.sort_values(["제품코드", "도착지", "적용일자"], ascending=[True, True, False])
     num_cols = [c for c in view.columns if c not in ("제품코드", "제품명", "도착지", "적용일자")]
     st.write(f"{len(view):,}줄")
-    st.dataframe(view.style.format({c: "{:,.2f}" for c in num_cols}, na_rep=""),
-                 hide_index=True, use_container_width=True, height=520)
+    shown = view.copy()
+    for c in num_cols:  # 빈칸이 None으로 보이지 않도록 글자로 표시
+        shown[c] = shown[c].map(lambda v: "" if pd.isna(v) else f"{v:,.2f}")
+    st.dataframe(shown, hide_index=True, use_container_width=True, height=520)
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
