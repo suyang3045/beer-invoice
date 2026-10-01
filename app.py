@@ -100,6 +100,17 @@ def next_serial(conn, d: date):
     return f"{prefix}-{seq:04d}"
 
 
+def round_half_up(x, places=0):
+    from decimal import Decimal, ROUND_HALF_UP
+    return float(Decimal(str(x)).quantize(Decimal(1).scaleb(-places), ROUND_HALF_UP))
+
+
+def calc_fee(qty, price):
+    """운반비 = 수량 × 단가(소수 둘째 자리), 원 단위 반올림."""
+    from decimal import Decimal
+    return round_half_up(Decimal(str(float(qty))) * Decimal(str(float(price))))
+
+
 def won(x):
     return f"{x:,.0f}"
 
@@ -206,13 +217,13 @@ def page_entry():
             missing.append(name)
             price = 0.0
         items.append({"product_code": code, "product_name": name, "qty": float(qty),
-                      "unit_price": price, "fee": float(round(qty * price))})
+                      "unit_price": price, "fee": calc_fee(qty, price)})
 
     if items:
         view = pd.DataFrame(items).rename(columns={
             "product_code": "제품코드", "product_name": "제품명", "qty": "수량",
             "unit_price": "단가", "fee": "운반비"})
-        st.dataframe(view.style.format({"수량": "{:,.0f}", "단가": "{:,.0f}", "운반비": "{:,.0f}"}),
+        st.dataframe(view.style.format({"수량": "{:,.0f}", "단가": "{:,.2f}", "운반비": "{:,.0f}"}),
                      use_container_width=True, hide_index=True)
     if missing:
         st.warning(f"단가가 없는 제품: {', '.join(missing)} (도착지 {price_dest}, {inv_date} 기준) — 0원으로 계산됩니다.")
@@ -341,12 +352,12 @@ def edit_invoice(serial, inv):
                 missing.append(name)
                 price = 0.0
         rows.append({"product_code": code, "product_name": name, "qty": float(qty),
-                     "unit_price": float(price), "fee": float(round(qty * price))})
+                     "unit_price": float(price), "fee": calc_fee(qty, price)})
     if rows:
         st.dataframe(pd.DataFrame(rows).rename(columns={
             "product_code": "제품코드", "product_name": "제품명", "qty": "수량",
             "unit_price": "단가", "fee": "운반비"}).style.format(
-            {"수량": "{:,.0f}", "단가": "{:,.0f}", "운반비": "{:,.0f}"}),
+            {"수량": "{:,.0f}", "단가": "{:,.2f}", "운반비": "{:,.0f}"}),
             hide_index=True, use_container_width=True)
     if missing:
         st.warning(f"단가표에 없는 제품: {', '.join(missing)} ({price_dest}, {new_date} 기준) — 0원으로 계산됩니다.")
@@ -572,10 +583,9 @@ def qlabel(y, qt):
     return f"{y}년 {qt}분기({m}~{m + 2}월)"
 
 
-def round_price(x, mode):
-    from decimal import Decimal, ROUND_HALF_UP
-    unit = {"원 단위": Decimal("1"), "10원 단위": Decimal("10"), "소수 첫째 자리": Decimal("0.1")}[mode]
-    return float((Decimal(str(x)) / unit).quantize(Decimal("1"), ROUND_HALF_UP) * unit)
+def round_price(x):
+    """새 단가는 소수 둘째 자리까지 (셋째 자리에서 반올림)."""
+    return round_half_up(x, 2)
 
 
 def page_price_change():
@@ -657,11 +667,11 @@ def page_price_change():
 
     # 3) 새 단가 미리보기
     st.subheader("③ 새 단가 미리보기")
-    mode = st.radio("단가 반올림", ["원 단위", "10원 단위", "소수 첫째 자리"], horizontal=True)
+    st.caption("새 단가는 소수 둘째 자리까지 계산합니다 (셋째 자리에서 반올림).")
     latest = (prices[prices["apply_date"] < apply_date.isoformat()]
               .sort_values("apply_date")
               .groupby(["product_name", "dest"], as_index=False).last())
-    latest["새단가"] = [round_price(p * (1 + rate), mode) for p in latest["price"]]
+    latest["새단가"] = [round_price(p * (1 + rate)) for p in latest["price"]]
     latest["차이"] = latest["새단가"] - latest["price"]
     view = latest.rename(columns={"product_code": "제품코드", "product_name": "제품명", "dest": "도착지",
                                   "apply_date": "기존 적용일", "price": "현재단가"})[
