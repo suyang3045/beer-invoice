@@ -487,7 +487,7 @@ def page_entry():
         st.session_state.inv_date = today_kst()
         st.session_state.inv_date_day = today_kst()
     inv_date = c1.date_input("작성일자", key="inv_date", format="YYYY-MM-DD")
-    slip_suffix = c2.text_input(f"전표번호  ({inv_date:%Y%m}_ 뒤 6자리까지)", key="slip_suffix", max_chars=6,
+    slip_suffix = c2.text_input(f"전표번호  ({inv_date:%Y%m}_ 뒤 6자리까지)", key=f"slip_suffix_{st.session_state.get('editor_ver', 0)}", max_chars=6,
                                 placeholder="번호 입력 후 Enter")
     if not slip_suffix.strip():
         st.warning("전표번호를 먼저 입력하세요. 전표번호를 입력해야 다음 항목이 나타납니다.")
@@ -646,7 +646,7 @@ def page_entry():
             return
 
         st.session_state.flash = f"{serial} 저장 완료 (운반비 {won(fee_total)}원)"
-        st.session_state.editor_ver += 1
+        st.session_state.editor_ver += 1  # 전표번호·제품 입력칸을 새 칸으로 (빈칸으로 리셋)
         st.session_state.cart = []
         for k in ("slip_suffix", "origin", "dest", "dest_code", "ptype", "swapped", "paid"):
             st.session_state.pop(k, None)
