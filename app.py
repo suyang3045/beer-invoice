@@ -161,7 +161,7 @@ def page_entry():
     # 기본 정보
     c1, c2 = st.columns([1, 2])
     inv_date = c1.date_input("작성일자", value=date.today(), format="YYYY-MM-DD")
-    slip_suffix = c2.text_input(f"전표번호  ({inv_date:%Y%m}_ 뒤)", key="slip_suffix")
+    slip_suffix = c2.text_input(f"전표번호  ({inv_date:%Y%m}_ 뒤 6자리까지)", key="slip_suffix", max_chars=6)
 
     # 출발지 / 도착지 / 도착지 코드 (기존 프로그램과 같은 방식)
     # 용기·환입을 고르면 출발지↔도착지가 화면에서 바뀌고, 단가는 바뀌기 전 도착지 기준으로 찾는다.
@@ -409,6 +409,7 @@ def edit_invoice(serial, inv):
                                  VALUES (:serial_no, :product_code, :product_name, :qty, :unit_price, :fee)"""),
                          [{**x, "serial_no": serial} for x in rows])
         st.session_state.flash = f"{serial} 수정 완료"
+        st.session_state.sel_serials = []
         st.session_state.list_ver = st.session_state.get("list_ver", 0) + 1
         st.rerun()
 
@@ -419,6 +420,7 @@ def edit_invoice(serial, inv):
                 conn.execute(text("DELETE FROM invoice_items WHERE serial_no = :s"), {"s": serial})
                 conn.execute(text("DELETE FROM invoices WHERE serial_no = :s"), {"s": serial})
             st.session_state.flash = f"{serial} 삭제 완료"
+            st.session_state.sel_serials = []
             st.session_state.list_ver = st.session_state.get("list_ver", 0) + 1
             st.rerun()
 
@@ -467,40 +469,69 @@ def page_list():
     s4.metric("결제완료", won(df.paid.sum()))
     s5.metric("미결제", won(df.total.sum() - df.paid.sum()))
 
-    items = q(f"""SELECT i.id, v.serial_no, v.invoice_date, v.origin, v.dest, i.product_code,
+    items = q(f"""SELECT i.id, v.serial_no, v.invoice_date, v.slip_no, v.origin, v.dest, i.product_code,
                          i.product_name, i.qty, i.unit_price, i.fee
                   FROM invoice_items i JOIN invoices v ON v.serial_no = i.serial_no
-                  WHERE {where} ORDER BY v.invoice_date, v.serial_no, i.id""", **params)
+                  WHERE {where} ORDER BY v.invoice_date, v.serial_no, i.id""", **params).reset_index(drop=True)
+
+    # 선택은 전표 단위: 한 줄만 체크해도 같은 전표의 모든 줄이 함께 체크된다
+    ss = st.session_state
+    chosen = [sn for sn in ss.get("sel_serials", []) if sn in set(items["serial_no"])]
     view = pd.DataFrame({
-        "날짜": items["invoice_date"], "출발지": items["origin"], "도착지": items["dest"],
-        "제품명": items["product_name"],
+        "선택": items["serial_no"].isin(chosen),
+        "날짜": items["invoice_date"], "전표번호": items["slip_no"].fillna(""),
+        "출발지": items["origin"], "도착지": items["dest"], "제품명": items["product_name"],
         "수량": items["qty"].map(lambda v: f"{v:,.0f}"),
         "단가": items["unit_price"].map(lambda v: f"{v:,.2f}"),
         "운반비": items["fee"].map(lambda v: f"{v:,.0f}"),
         "일련번호": items["serial_no"],
     })
-    st.caption("맨 왼쪽 네모 칸을 체크하면 아래에 수정·삭제가 나타납니다.")
-    ver = st.session_state.setdefault("list_ver", 0)
-    event = st.dataframe(view, hide_index=True, use_container_width=True, on_select="rerun",
-                         selection_mode="multi-row", key=f"item_table_{ver}")
-    sel = items.iloc[event.selection.rows] if event.selection.rows else items.iloc[0:0]
+    st.caption("맨 왼쪽 칸을 체크하면 같은 전표의 모든 품목이 함께 선택되고, 아래에 수정·삭제가 나타납니다.")
+    ver = ss.setdefault("list_ver", 0)
+    edited = st.data_editor(
+        view, hide_index=True, use_container_width=True, key=f"item_table_{ver}",
+        disabled=[c for c in view.columns if c != "선택"],
+        column_config={"선택": st.column_config.CheckboxColumn("선택", width="small")},
+    )
+    flipped = edited.index[edited["선택"] != view["선택"]]
+    if len(flipped):
+        new_sel = list(chosen)
+        for i in flipped:
+            sn = items.at[i, "serial_no"]
+            if bool(edited.at[i, "선택"]) and sn not in new_sel:
+                new_sel.append(sn)
+            elif not bool(edited.at[i, "선택"]) and sn in new_sel:
+                new_sel.remove(sn)
+        ss.sel_serials = new_sel
+        ss.list_ver = ver + 1
+        st.rerun()
 
-    if not sel.empty:
-        serials = list(dict.fromkeys(sel["serial_no"]))
+    if chosen:
+        sel = items[items["serial_no"].isin(chosen)]
         st.divider()
-        st.write(f"선택: **{len(sel)}줄** (전표 {', '.join(serials)})")
-        with st.popover(f"🗑️ 선택한 {len(sel)}줄 삭제"):
-            st.write("선택한 제품 줄을 삭제합니다. 줄이 모두 지워진 전표는 전표째 삭제됩니다.")
-            if st.button("삭제 확인", type="primary", key="del_rows"):
-                delete_item_rows(sel["id"].tolist(), serials)
-                st.session_state.list_ver += 1
-                st.session_state.flash = f"{len(sel)}줄을 삭제했습니다."
+        st.write(f"선택한 전표 **{len(chosen)}건** (품목 {len(sel)}줄): "
+                 + ", ".join(f"{sn} ({df.loc[df.serial_no == sn, 'slip_no'].iloc[0] or '-'})" for sn in chosen))
+        b1, b2 = st.columns([1, 4])
+        if b1.button("선택 해제"):
+            ss.sel_serials = []
+            ss.list_ver = ver + 1
+            st.rerun()
+        with b2.popover(f"🗑️ 선택한 전표 {len(chosen)}건 삭제"):
+            st.write("선택한 전표와 그 전표의 모든 품목을 삭제합니다.")
+            if st.button("삭제 확인", type="primary", key="del_invoices"):
+                with engine().begin() as conn:
+                    for sn in chosen:
+                        conn.execute(text("DELETE FROM invoice_items WHERE serial_no = :s"), {"s": sn})
+                        conn.execute(text("DELETE FROM invoices WHERE serial_no = :s"), {"s": sn})
+                ss.sel_serials = []
+                ss.list_ver = ver + 1
+                ss.flash = f"전표 {len(chosen)}건을 삭제했습니다."
                 st.rerun()
-        if len(serials) == 1:
-            st.subheader(f"✏️ {serials[0]} 수정")
-            edit_invoice(serials[0], df[df.serial_no == serials[0]].iloc[0])
-        else:
-            st.info("수정은 한 전표의 줄만 체크했을 때 할 수 있습니다. 삭제는 여러 줄을 한꺼번에 할 수 있습니다.")
+
+        tabs = st.tabs([f"✏️ {sn} 수정" for sn in chosen])
+        for tab, sn in zip(tabs, chosen):
+            with tab:
+                edit_invoice(sn, df[df.serial_no == sn].iloc[0])
 
     # 엑셀 다운로드
     buf = io.BytesIO()
