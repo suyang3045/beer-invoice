@@ -26,8 +26,8 @@ st.markdown("""
 #MainMenu, [data-testid="stToolbar"], [data-testid="stDecoration"],
 [data-testid="stStatusWidget"], footer,
 [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],
-[data-testid="stExpandSidebarButton"] {display: none !important;}
-.block-container {padding-top: 1.5rem !important;}
+[data-testid="stExpandSidebarButton"], [data-testid="stHeader"], header {display: none !important;}
+.block-container, [data-testid="stMainBlockContainer"] {padding-top: 1rem !important;}
 </style>
 """, unsafe_allow_html=True)
 
