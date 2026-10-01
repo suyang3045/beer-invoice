@@ -247,6 +247,9 @@ def page_entry():
         if not origin or not dest:
             st.error("출발지와 도착지를 선택하세요.")
             return
+        if origin == dest:
+            st.error("출발지와 도착지가 같습니다. 다시 확인하세요.")
+            return
         if not items:
             st.error("제품과 수량을 한 줄 이상 입력하세요.")
             return
@@ -376,6 +379,9 @@ def edit_invoice(serial, inv):
     if b1.button("✏️ 수정 내용 저장", type="primary", use_container_width=True, key=k + "save"):
         if not rows:
             st.error("제품 줄이 하나 이상 있어야 합니다. 전표를 없애려면 삭제를 이용하세요.")
+            return
+        if new_origin == new_dest:
+            st.error("출발지와 도착지가 같습니다. 다시 확인하세요.")
             return
         biz = partners.loc[partners["name"] == new_partner, "biz_no"]
         with engine().begin() as conn:
@@ -624,6 +630,12 @@ def page_price_change():
 
     fuel_map = {(int(r.연도), int(r.분기)): float(r.경유평균가) for r in fuel.dropna().itertuples(index=False)}
 
+    price_change_judgement(fuel_map)
+    st.divider()
+    reapply_section()
+
+
+def price_change_judgement(fuel_map):
     # 2) 변경 판단
     st.subheader("② 단가 변경 판단")
     prices = q("SELECT apply_date, product_code, product_name, dest, price FROM unit_prices")
@@ -695,10 +707,125 @@ def page_price_change():
         st.rerun()
 
 
+def reapply_section():
+    st.subheader("④ 이미 입력한 전표에 단가 다시 적용")
+    st.caption("새 단가를 저장하기 전에 입력한 전표가 있으면, 작성일자 기준 단가표 단가로 다시 계산합니다. "
+               "결제완료 금액은 바꾸지 않습니다.")
+    prices = load_prices()
+    if prices.empty:
+        return
+    from_d = st.date_input("작성일자가 이 날짜 이후(포함)인 전표",
+                           value=date.fromisoformat(prices["apply_date"].max()),
+                           format="YYYY-MM-DD", key="reapply_from")
+    invs = q("""SELECT serial_no, invoice_date, origin, dest, product_type, fee_total
+                FROM invoices WHERE invoice_date >= :d""", d=from_d.isoformat())
+    if invs.empty:
+        st.info("해당 기간에 입력된 전표가 없습니다.")
+        return
+    items = q("""SELECT i.id, i.serial_no, i.product_name, i.qty, i.unit_price
+                 FROM invoice_items i JOIN invoices v ON v.serial_no = i.serial_no
+                 WHERE v.invoice_date >= :d""", d=from_d.isoformat())
+    inv_map = invs.set_index("serial_no")
+
+    changes = []
+    for it in items.itertuples(index=False):
+        inv = inv_map.loc[it.serial_no]
+        pdest = inv.origin if inv.product_type in SWAP_TYPES else inv.dest
+        new_p = lookup_price(prices, it.product_name, pdest, date.fromisoformat(inv.invoice_date))
+        if new_p is not None and abs(new_p - float(it.unit_price or 0)) > 0.001:
+            changes.append({"id": it.id, "serial_no": it.serial_no, "qty": float(it.qty or 0),
+                            "old": float(it.unit_price or 0), "new": new_p, "fee": calc_fee(it.qty or 0, new_p)})
+    if not changes:
+        st.success("모든 전표가 작성일자 기준 단가로 계산되어 있습니다. 다시 적용할 전표가 없습니다.")
+        return
+
+    ch = pd.DataFrame(changes)
+    new_fee = (items.assign(fee_new=[calc_fee(r.qty or 0, r.unit_price or 0) for r in items.itertuples()])
+               .set_index("id"))
+    for c in changes:
+        new_fee.loc[c["id"], "fee_new"] = c["fee"]
+    per_inv = new_fee.groupby("serial_no")["fee_new"].sum()
+    summary = inv_map.loc[ch["serial_no"].unique(), ["invoice_date", "fee_total"]].copy()
+    summary["새 운반비"] = per_inv.reindex(summary.index)
+    summary["차이"] = summary["새 운반비"] - summary["fee_total"]
+    summary = summary.reset_index().rename(columns={"serial_no": "일련번호", "invoice_date": "작성일자",
+                                                    "fee_total": "기존 운반비"})
+    st.write(f"단가가 다른 제품 줄 **{len(ch)}건**, 전표 **{len(summary)}건**")
+    st.dataframe(summary.style.format({"기존 운반비": "{:,.0f}", "새 운반비": "{:,.0f}", "차이": "{:+,.0f}"}),
+                 hide_index=True, use_container_width=True)
+    if st.button(f"🔁 전표 {len(summary)}건 단가 다시 적용", type="primary"):
+        with engine().begin() as conn:
+            conn.execute(text("UPDATE invoice_items SET unit_price = :p, fee = :f WHERE id = :i"),
+                         [{"p": c["new"], "f": c["fee"], "i": int(c["id"])} for c in changes])
+            for sn, fee_total in per_inv.reindex(summary["일련번호"]).items():
+                vat = round(fee_total * VAT_RATE)
+                conn.execute(text("UPDATE invoices SET fee_total = :f, vat = :v, total = :t WHERE serial_no = :s"),
+                             {"f": float(fee_total), "v": float(vat), "t": float(fee_total + vat), "s": sn})
+        st.session_state.flash = f"전표 {len(summary)}건의 단가를 다시 적용했습니다."
+        st.rerun()
+
+
+# ───────────────────────── 단가표 조회 ─────────────────────────
+def page_price_table():
+    st.header("단가표 조회")
+    if msg := st.session_state.pop("flash", None):
+        st.success(msg)
+    prices = q("""SELECT apply_date AS 적용일자, product_code AS 제품코드, product_name AS 제품명,
+                         dest AS 도착지, price AS 단가 FROM unit_prices""")
+    if prices.empty:
+        st.info("단가표가 비어 있습니다.")
+        return
+    dates = sorted(prices["적용일자"].unique(), reverse=True)
+
+    c1, c2, c3 = st.columns([1, 2, 2])
+    mode = c1.radio("보기", ["적용일자별 비교", "전체 목록"])
+    prods = c2.multiselect("제품 (비우면 전체)", sorted(prices["제품명"].dropna().unique()))
+    dsts = c3.multiselect("도착지 (비우면 전체)", sorted(prices["도착지"].dropna().unique()))
+    f = prices
+    if prods:
+        f = f[f["제품명"].isin(prods)]
+    if dsts:
+        f = f[f["도착지"].isin(dsts)]
+
+    if mode == "적용일자별 비교":
+        sel_dates = st.multiselect("비교할 적용일자", dates, default=dates[:3])
+        f = f[f["적용일자"].isin(sel_dates)]
+        view = (f.pivot_table(index=["제품코드", "제품명", "도착지"], columns="적용일자", values="단가", aggfunc="last")
+                .reindex(columns=sorted(sel_dates, reverse=True)).reset_index())
+        st.caption("가로로 적용일자별 단가를 비교합니다. 빈칸은 그 적용일자에 단가가 없다는 뜻입니다.")
+    else:
+        view = f.sort_values(["제품코드", "도착지", "적용일자"], ascending=[True, True, False])
+    num_cols = [c for c in view.columns if c not in ("제품코드", "제품명", "도착지", "적용일자")]
+    st.write(f"{len(view):,}줄")
+    st.dataframe(view.style.format({c: "{:,.2f}" for c in num_cols}, na_rep=""),
+                 hide_index=True, use_container_width=True, height=520)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        view.to_excel(xw, sheet_name="단가표", index=False)
+    st.download_button("📥 엑셀로 내려받기", buf.getvalue(), file_name="단가표.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    st.divider()
+    with st.expander("🗑️ 적용일자별 단가 삭제"):
+        st.caption("잘못 들어간 적용일자의 단가를 한꺼번에 지웁니다. 이미 입력한 전표의 단가는 바뀌지 않습니다.")
+        d = st.selectbox("삭제할 적용일자", dates, index=None, placeholder="적용일자 선택")
+        if d:
+            n = int((prices["적용일자"] == d).sum())
+            st.warning(f"{d} 적용 단가 {n:,}건을 삭제합니다.")
+            if st.checkbox("확인했습니다", key="del_price_ok") and st.button(f"{d} 단가 {n:,}건 삭제", type="primary"):
+                with engine().begin() as conn:
+                    conn.execute(text("DELETE FROM unit_prices WHERE apply_date = :d"), {"d": d})
+                clear_caches()
+                st.session_state.flash = f"{d} 적용 단가 {n:,}건을 삭제했습니다."
+                st.rerun()
+
+
 # ───────────────────────── main ─────────────────────────
 if check_password():
-    page = st.sidebar.radio("메뉴", ["전표 입력", "전표 조회", "단가 변경", "단가·거래처 관리"])
+    page = st.sidebar.radio("메뉴", ["전표 입력", "전표 조회", "단가표 조회", "단가 변경", "단가·거래처 관리"])
     if st.sidebar.button("🔄 기준정보 새로고침"):
         clear_caches()
-    {"전표 입력": page_entry, "전표 조회": page_list, "단가 변경": page_price_change,
+    {"전표 입력": page_entry, "전표 조회": page_list, "단가표 조회": page_price_table,
+     "단가 변경": page_price_change,
      "단가·거래처 관리": page_admin}[page]()
