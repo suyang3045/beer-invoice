@@ -409,6 +409,7 @@ def edit_invoice(serial, inv):
                                  VALUES (:serial_no, :product_code, :product_name, :qty, :unit_price, :fee)"""),
                          [{**x, "serial_no": serial} for x in rows])
         st.session_state.flash = f"{serial} 수정 완료"
+        st.session_state.list_ver = st.session_state.get("list_ver", 0) + 1
         st.rerun()
 
     with b2.popover("🗑️ 삭제", use_container_width=True):
@@ -418,7 +419,24 @@ def edit_invoice(serial, inv):
                 conn.execute(text("DELETE FROM invoice_items WHERE serial_no = :s"), {"s": serial})
                 conn.execute(text("DELETE FROM invoices WHERE serial_no = :s"), {"s": serial})
             st.session_state.flash = f"{serial} 삭제 완료"
+            st.session_state.list_ver = st.session_state.get("list_ver", 0) + 1
             st.rerun()
+
+
+def delete_item_rows(ids, serials):
+    """선택한 제품 줄을 지우고 전표 합계를 다시 계산. 줄이 하나도 안 남은 전표는 전표째 삭제."""
+    with engine().begin() as conn:
+        conn.execute(text("DELETE FROM invoice_items WHERE id = :i"), [{"i": int(i)} for i in ids])
+        for sn in serials:
+            fee = conn.execute(text("SELECT COUNT(*), COALESCE(SUM(fee), 0) FROM invoice_items WHERE serial_no = :s"),
+                               {"s": sn}).fetchone()
+            if fee[0] == 0:
+                conn.execute(text("DELETE FROM invoices WHERE serial_no = :s"), {"s": sn})
+            else:
+                f = float(fee[1])
+                vat = round(f * VAT_RATE)
+                conn.execute(text("UPDATE invoices SET fee_total = :f, vat = :v, total = :t WHERE serial_no = :s"),
+                             {"f": f, "v": float(vat), "t": f + vat, "s": sn})
 
 
 def page_list():
@@ -438,7 +456,6 @@ def page_list():
         where += " AND v.partner_name = :n"
         params["n"] = who
     df = q(f"SELECT v.* FROM invoices v WHERE {where} ORDER BY v.invoice_date, v.serial_no", **params)
-
     if df.empty:
         st.info("이 기간에 저장된 전표가 없습니다.")
         return
@@ -450,48 +467,54 @@ def page_list():
     s4.metric("결제완료", won(df.paid.sum()))
     s5.metric("미결제", won(df.total.sum() - df.paid.sum()))
 
-    view = df[["serial_no", "invoice_date", "slip_no", "partner_name", "origin", "dest",
-               "product_type", "unload_type", "empty_type", "fee_total", "vat", "total", "paid"]]
-    names = {"serial_no": "일련번호", "invoice_date": "작성일자", "slip_no": "전표번호",
-             "partner_name": "상호", "origin": "출발지", "dest": "도착지", "product_type": "제품구분",
-             "unload_type": "하차구분", "empty_type": "공차구분", "fee_total": "운반비",
-             "vat": "부가세", "total": "합계", "paid": "결제완료"}
-    st.caption("결제완료 칸만 수정할 수 있습니다. 수정 후 아래 버튼을 누르세요.")
-    edited = st.data_editor(
-        view.rename(columns=names), hide_index=True, use_container_width=True,
-        disabled=[v for k, v in names.items() if k != "paid"],
-        column_config={c: st.column_config.NumberColumn(format="localized")
-                       for c in ("운반비", "부가세", "합계", "결제완료")},
-        key="list_editor",
-    )
-    edited["결제완료"] = edited["결제완료"].fillna(0)
-    changed = edited[edited["결제완료"] != view["paid"].values]
-    if st.button(f"결제완료 변경 저장 ({len(changed)}건)", disabled=changed.empty):
-        with engine().begin() as conn:
-            for r in changed.itertuples(index=False):
-                conn.execute(text("UPDATE invoices SET paid = :p WHERE serial_no = :s"),
-                             {"p": float(r.결제완료), "s": r.일련번호})
-        st.success("저장했습니다.")
-        st.rerun()
+    items = q(f"""SELECT i.id, v.serial_no, v.invoice_date, v.origin, v.dest, i.product_code,
+                         i.product_name, i.qty, i.unit_price, i.fee
+                  FROM invoice_items i JOIN invoices v ON v.serial_no = i.serial_no
+                  WHERE {where} ORDER BY v.invoice_date, v.serial_no, i.id""", **params)
+    view = pd.DataFrame({
+        "날짜": items["invoice_date"], "출발지": items["origin"], "도착지": items["dest"],
+        "제품명": items["product_name"],
+        "수량": items["qty"].map(lambda v: f"{v:,.0f}"),
+        "단가": items["unit_price"].map(lambda v: f"{v:,.2f}"),
+        "운반비": items["fee"].map(lambda v: f"{v:,.0f}"),
+        "일련번호": items["serial_no"],
+    })
+    st.caption("맨 왼쪽 네모 칸을 체크하면 아래에 수정·삭제가 나타납니다.")
+    ver = st.session_state.setdefault("list_ver", 0)
+    event = st.dataframe(view, hide_index=True, use_container_width=True, on_select="rerun",
+                         selection_mode="multi-row", key=f"item_table_{ver}")
+    sel = items.iloc[event.selection.rows] if event.selection.rows else items.iloc[0:0]
 
-    # 상세 / 수정 / 삭제
-    st.subheader("전표 상세 · 수정")
-    serial = st.selectbox("일련번호", df.serial_no.tolist(), index=None,
-                          placeholder="수정하거나 볼 전표를 고르세요")
-    if serial:
-        edit_invoice(serial, df[df.serial_no == serial].iloc[0])
+    if not sel.empty:
+        serials = list(dict.fromkeys(sel["serial_no"]))
+        st.divider()
+        st.write(f"선택: **{len(sel)}줄** (전표 {', '.join(serials)})")
+        with st.popover(f"🗑️ 선택한 {len(sel)}줄 삭제"):
+            st.write("선택한 제품 줄을 삭제합니다. 줄이 모두 지워진 전표는 전표째 삭제됩니다.")
+            if st.button("삭제 확인", type="primary", key="del_rows"):
+                delete_item_rows(sel["id"].tolist(), serials)
+                st.session_state.list_ver += 1
+                st.session_state.flash = f"{len(sel)}줄을 삭제했습니다."
+                st.rerun()
+        if len(serials) == 1:
+            st.subheader(f"✏️ {serials[0]} 수정")
+            edit_invoice(serials[0], df[df.serial_no == serials[0]].iloc[0])
+        else:
+            st.info("수정은 한 전표의 줄만 체크했을 때 할 수 있습니다. 삭제는 여러 줄을 한꺼번에 할 수 있습니다.")
 
     # 엑셀 다운로드
-    all_items = q(f"""SELECT i.* FROM invoice_items i JOIN invoices v ON v.serial_no = i.serial_no
-                      WHERE {where} ORDER BY i.serial_no, i.id""", **params)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        view.rename(columns=names).to_excel(xw, sheet_name="전표", index=False)
-        all_items.drop(columns=["id"]).rename(columns={
-            "serial_no": "일련번호", "product_code": "제품코드", "product_name": "제품명",
-            "qty": "수량", "unit_price": "단가", "fee": "운반비"}).to_excel(xw, sheet_name="제품내역", index=False)
-    st.download_button("📥 엑셀로 내려받기", buf.getvalue(),
-                       file_name=f"운송전표_{d_from}_{d_to}.xlsx",
+        df.rename(columns={"serial_no": "일련번호", "invoice_date": "작성일자", "slip_no": "전표번호",
+                           "partner_name": "상호", "biz_no": "사업자번호", "origin": "출발지", "dest": "도착지",
+                           "product_type": "제품구분", "unload_type": "하차구분", "empty_type": "공차구분",
+                           "fee_total": "운반비", "vat": "부가세", "total": "합계", "paid": "결제완료"}
+                  ).drop(columns=["created_at"], errors="ignore").to_excel(xw, sheet_name="전표", index=False)
+        items.drop(columns=["id"]).rename(columns={
+            "serial_no": "일련번호", "invoice_date": "날짜", "origin": "출발지", "dest": "도착지",
+            "product_code": "제품코드", "product_name": "제품명", "qty": "수량", "unit_price": "단가",
+            "fee": "운반비"}).to_excel(xw, sheet_name="제품내역", index=False)
+    st.download_button("📥 엑셀로 내려받기", buf.getvalue(), file_name=f"운송전표_{d_from}_{d_to}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
