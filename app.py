@@ -6,6 +6,7 @@
 import hashlib
 import hmac
 import re
+import secrets as pysecrets
 import io
 import os
 from datetime import date, datetime, timedelta
@@ -17,13 +18,16 @@ from sqlalchemy.exc import IntegrityError
 
 from db import DEFAULT_PARTNER, make_engine
 
-st.set_page_config(page_title="맥주 운송전표", page_icon="🍺", layout="wide")
+st.set_page_config(page_title="맥주 운송전표", page_icon="🍺", layout="wide", initial_sidebar_state="collapsed")
 
 # 앱 안쪽의 Streamlit 메뉴·장식 숨기기 (사이드바 열기 버튼은 남겨 둠)
 st.markdown("""
 <style>
 #MainMenu, [data-testid="stToolbar"], [data-testid="stDecoration"],
-[data-testid="stStatusWidget"], footer {display: none !important;}
+[data-testid="stStatusWidget"], footer,
+[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],
+[data-testid="stExpandSidebarButton"] {display: none !important;}
+.block-container {padding-top: 1.5rem !important;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -166,6 +170,8 @@ def ensure_auth_schema():
         conn.execute(text("""CREATE TABLE IF NOT EXISTS users (
                                  user_id TEXT PRIMARY KEY, name TEXT, pw_hash TEXT NOT NULL,
                                  is_admin INTEGER DEFAULT 0, active INTEGER DEFAULT 1, created_at TEXT)"""))
+        conn.execute(text("""CREATE TABLE IF NOT EXISTS login_tokens (
+                                 token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires TEXT NOT NULL)"""))
     cols = {c["name"] for c in sa_inspect(eng).get_columns("invoices")}
     for col in ("created_by", "paid_date"):
         if col not in cols:
@@ -209,10 +215,34 @@ ID_HELP = "아이디는 영문 6자리 + 숫자 4자리로 만드세요. (예: s
 PW_HELP = "비밀번호는 숫자 6자리로 만드세요."
 
 
+KEEP_DAYS = 90
+
+
+def issue_token(user_id):
+    tok = pysecrets.token_urlsafe(24)
+    with engine().begin() as conn:
+        conn.execute(text("INSERT INTO login_tokens (token, user_id, expires) VALUES (:t, :u, :e)"),
+                     {"t": tok, "u": user_id, "e": (date.today() + timedelta(days=KEEP_DAYS)).isoformat()})
+    st.query_params["t"] = tok
+    st.session_state.token = tok
+
+
 def login():
     ensure_auth_schema()
     if me():
         return True
+    tok = st.query_params.get("t")
+    if tok:
+        row = q("""SELECT u.user_id, u.name, u.is_admin FROM login_tokens t
+                   JOIN users u ON u.user_id = t.user_id
+                   WHERE t.token = :t AND t.expires >= :today AND u.active = 1""",
+                t=tok, today=date.today().isoformat())
+        if not row.empty:
+            st.session_state.user = {"user_id": row.user_id[0], "name": row.name[0],
+                                     "is_admin": bool(row.is_admin[0])}
+            st.session_state.token = tok
+            return True
+        del st.query_params["t"]
     st.title("🍺 맥주 운송전표")
     n_users = int(q("SELECT COUNT(*) AS n FROM users").n[0])
 
@@ -250,26 +280,45 @@ def login():
     with st.form("login"):
         uid = st.text_input("아이디")
         pw = st.text_input("비밀번호 (숫자 6자리)", type="password", max_chars=6)
+        keep = st.checkbox("이 기기에서 로그인 상태 유지 (자동 로그인)", value=True)
         if st.form_submit_button("로그인", type="primary"):
             row = q("SELECT user_id, name, pw_hash, is_admin FROM users WHERE user_id = :u AND active = 1",
                     u=uid.strip())
             if not row.empty and check_pw(pw, row.pw_hash[0]):
                 st.session_state.user = {"user_id": row.user_id[0], "name": row.name[0],
                                          "is_admin": bool(row.is_admin[0])}
+                if keep:
+                    issue_token(row.user_id[0])
                 st.rerun()
             st.error("아이디 또는 비밀번호가 맞지 않습니다.")
     return False
 
 
-def sidebar_account():
+def logout():
+    tok = st.session_state.get("token")
+    if tok:
+        with engine().begin() as conn:
+            conn.execute(text("DELETE FROM login_tokens WHERE token = :t"), {"t": tok})
+    st.query_params.clear()
+    st.session_state.clear()
+    st.rerun()
+
+
+def account_menu():
     u = me()
-    st.sidebar.markdown(f"👤 **{u['name']}** ({u['user_id']}{', 관리자' if u['is_admin'] else ''})")
-    if st.sidebar.button("로그아웃"):
-        st.session_state.clear()
-        st.rerun()
-    with st.sidebar.expander("비밀번호 변경"):
+    with st.popover(f"👤 {u['name']}", use_container_width=True):
+        st.markdown(f"**{u['name']}** ({u['user_id']}{', 관리자' if u['is_admin'] else ''})")
+        if st.session_state.get("token"):
+            st.caption("자동 로그인 사용 중입니다. 지금 주소를 휴대폰 홈 화면에 추가하면 바로 열립니다. "
+                       "이 주소는 다른 사람에게 보내지 마세요.")
+        if st.button("로그아웃", use_container_width=True):
+            logout()
+        if st.button("🔄 기준정보 새로고침", use_container_width=True):
+            clear_caches()
+            st.rerun()
+        st.markdown("**비밀번호 변경**")
         with st.form("chpw", clear_on_submit=True):
-            old = st.text_input("현재 비밀번호", type="password")
+            old = st.text_input("현재 비밀번호", type="password", max_chars=6)
             new1 = st.text_input("새 비밀번호 (숫자 6자리)", type="password", max_chars=6)
             new2 = st.text_input("새 비밀번호 확인", type="password", max_chars=6)
             if st.form_submit_button("변경"):
@@ -284,6 +333,9 @@ def sidebar_account():
                     with engine().begin() as conn:
                         conn.execute(text("UPDATE users SET pw_hash = :h WHERE user_id = :u"),
                                      {"h": hash_pw(new1), "u": u["user_id"]})
+                        # 비밀번호를 바꾸면 다른 기기의 자동 로그인은 해제
+                        conn.execute(text("DELETE FROM login_tokens WHERE user_id = :u AND token <> :t"),
+                                     {"u": u["user_id"], "t": st.session_state.get("token") or ""})
                     st.success("변경했습니다.")
 
 
@@ -342,6 +394,7 @@ def page_users():
                     with engine().begin() as conn:
                         conn.execute(text("UPDATE users SET pw_hash = :h WHERE user_id = :u"),
                                      {"h": hash_pw(npw), "u": target})
+                        conn.execute(text("DELETE FROM login_tokens WHERE user_id = :u"), {"u": target})
                     st.session_state.flash = f"{target} 비밀번호를 바꿨습니다."
                     st.rerun()
         with c2:
@@ -357,6 +410,8 @@ def page_users():
                     with engine().begin() as conn:
                         conn.execute(text("UPDATE users SET is_admin = :a, active = :t WHERE user_id = :u"),
                                      {"a": int(new_admin), "t": int(new_active), "u": target})
+                        if not new_active:
+                            conn.execute(text("DELETE FROM login_tokens WHERE user_id = :u"), {"u": target})
                     st.session_state.flash = f"{target} 설정을 저장했습니다."
                     st.rerun()
 
@@ -1242,12 +1297,19 @@ def page_price_table():
 
 # ───────────────────────── main ─────────────────────────
 if login():
-    sidebar_account()
     pages = {"전표 입력": page_entry, "전표 조회": page_list, "결제 관리": page_payments,
              "단가표 조회": page_price_table}
     if is_admin():
         pages.update({"단가 변경": page_price_change, "단가·거래처 관리": page_admin, "사용자 관리": page_users})
-    page = st.sidebar.radio("메뉴", list(pages))
-    if st.sidebar.button("🔄 기준정보 새로고침"):
-        clear_caches()
+    names = list(pages)
+    c1, c2 = st.columns([5, 1])
+    with c1:
+        sel = st.segmented_control("메뉴", names, default=st.session_state.get("last_page", names[0]),
+                                   key="nav", label_visibility="collapsed")
+    with c2:
+        account_menu()
+    page = sel if sel in pages else st.session_state.get("last_page", names[0])
+    if page not in pages:
+        page = names[0]
+    st.session_state.last_page = page
     pages[page]()
