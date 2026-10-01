@@ -25,6 +25,7 @@ VAT_RATE = 0.1
 EMPTY_ROWS = 5
 DEFAULT_ORIGIN = "강원공장"
 CONTAINER_PREFIX = "201"
+MAX_MATCHES = 30
 
 
 # ───────────────────────── 공통 ─────────────────────────
@@ -81,6 +82,26 @@ def lookup_price(prices, name, dest, d: date):
     if m.empty:
         return None
     return float(m.sort_values("apply_date").iloc[-1]["price"])
+
+
+# 검색어 별칭: 현장에서 부르는 말 → 제품명에 실제로 들어 있는 글자
+SEARCH_ALIASES = {
+    "생맥주": ["유흥생"], "생맥": ["유흥생"], "생": ["유흥생"], "케그": ["유흥생"],
+    "캘리": ["캘리", "켈리"], "켈리": ["캘리", "켈리"],
+    "하이트": ["하이트", "hite"], "맥스": ["맥스", "맥)"],
+    "필라이트": ["필)", "필후)", "필클리어"],
+    "페트": ["피쳐"], "피처": ["피쳐"],
+    "파렛트": ["파렛", "pallet"], "팔레트": ["파렛", "pallet"], "파레트": ["파렛", "pallet"],
+    "박스": ["box"], "가스": ["co2"], "탄산": ["co2"],
+}
+
+
+def search_products(labels, kw):
+    """띄어 쓴 단어가 모두 들어 있는 제품 (대소문자·공백 무시, 코드·별칭으로도 검색)."""
+    words = [w for w in kw.lower().split() if w]
+    alts = [[a.lower().replace(" ", "") for a in SEARCH_ALIASES.get(w, [])] + [w] for w in words]
+    return [l for l in labels
+            if all(any(a in l.lower().replace(" ", "") for a in alt) for alt in alts)]
 
 
 def current_product_labels(prices, d: date):
@@ -161,7 +182,11 @@ def page_entry():
     # 기본 정보
     c1, c2 = st.columns([1, 2])
     inv_date = c1.date_input("작성일자", value=date.today(), format="YYYY-MM-DD")
-    slip_suffix = c2.text_input(f"전표번호  ({inv_date:%Y%m}_ 뒤 6자리까지)", key="slip_suffix", max_chars=6)
+    slip_suffix = c2.text_input(f"전표번호  ({inv_date:%Y%m}_ 뒤 6자리까지)", key="slip_suffix", max_chars=6,
+                                placeholder="번호 입력 후 Enter")
+    if not slip_suffix.strip():
+        st.warning("전표번호를 먼저 입력하세요. 전표번호를 입력해야 다음 항목이 나타납니다.")
+        return
 
     # 출발지 / 도착지 / 도착지 코드 (기존 프로그램과 같은 방식)
     # 용기·환입을 고르면 출발지↔도착지가 화면에서 바뀌고, 단가는 바뀌기 전 도착지 기준으로 찾는다.
@@ -206,23 +231,50 @@ def page_entry():
         [f"{r.product_code} - {r.product_name}" for r in products.itertuples()]
     if product_type == "용기":  # 용기는 201로 시작하는 코드를 먼저 보여 준다
         product_labels.sort(key=lambda l: (not l.startswith(CONTAINER_PREFIX), l))
-    ver = st.session_state.setdefault("editor_ver", 0)
-    edited = st.data_editor(
-        pd.DataFrame({"제품": pd.Series([""] * EMPTY_ROWS, dtype="object"),
-                      "수량": pd.Series([float("nan")] * EMPTY_ROWS, dtype="float64")}),
-        column_config={
-            "제품": st.column_config.SelectboxColumn("제품코드 - 제품명", options=product_labels, width="large"),
-            "수량": st.column_config.NumberColumn("수량", min_value=0, step=1),
-        },
-        num_rows="dynamic", use_container_width=True, hide_index=True, key=f"items_{ver}",
-    )
+    ver = ss.setdefault("editor_ver", 0)
+    cart = ss.setdefault("cart", [])  # [{"label": "코드 - 이름", "qty": 수량}]
+    addv = ss.setdefault("add_ver", 0)
+
+    with st.container(border=True):
+        kw = st.text_input("제품 검색", key=f"kw_{ver}_{addv}",
+                           placeholder="예: 생맥주, 유흥, 캔, 테라 500 (띄어 쓰면 모두 포함된 제품)")
+        if kw.strip():
+            matches = search_products(product_labels, kw)
+        elif product_type == "용기":
+            matches = [l for l in product_labels if l.startswith(CONTAINER_PREFIX)]
+        else:
+            matches = []
+        pick = None
+        if kw.strip() and not matches:
+            st.caption("검색 결과가 없습니다. 다른 단어로 찾아보세요.")
+        if matches:
+            if len(matches) > MAX_MATCHES:
+                st.caption(f"{len(matches)}개 중 {MAX_MATCHES}개만 보여 줍니다. 검색어를 더 입력하세요.")
+            pick = st.radio("제품 선택", matches[:MAX_MATCHES], index=None, key=f"pick_{ver}_{addv}")
+        c1, c2 = st.columns([2, 1])
+        qty_new = c1.number_input("수량", min_value=0, step=1, value=None, key=f"qty_{ver}_{addv}")
+        c2.write("")
+        if c2.button("➕ 추가", use_container_width=True, disabled=not (pick and qty_new),
+                     key=f"add_{ver}_{addv}"):
+            cart.append({"label": pick, "qty": float(qty_new)})
+            ss.add_ver = addv + 1
+            st.rerun()
+
+    for i, it in enumerate(list(cart)):
+        c1, c2, c3 = st.columns([5, 2, 1])
+        c1.write(it["label"])
+        it["qty"] = float(c2.number_input("수량", min_value=0, step=1, value=int(it["qty"]),
+                                          key=f"cq_{ver}_{i}_{it['label']}", label_visibility="collapsed"))
+        if c3.button("❌", key=f"rm_{ver}_{i}_{it['label']}"):
+            cart.pop(i)
+            st.rerun()
 
     items, missing = [], []
-    for row in edited.itertuples(index=False):
-        label, qty = row[0], row[1]
-        if not isinstance(label, str) or not label or pd.isna(qty) or qty == 0:
+    for it in cart:
+        if not it["qty"]:
             continue
-        code, name = label.split(" - ", 1)
+        code, name = it["label"].split(" - ", 1)
+        qty = it["qty"]
         price = lookup_price(prices, name, price_dest, inv_date) if price_dest else None
         if price is None:
             missing.append(name)
@@ -296,6 +348,7 @@ def page_entry():
 
         st.session_state.flash = f"{serial} 저장 완료 (합계 {won(total)}원)"
         st.session_state.editor_ver += 1
+        st.session_state.cart = []
         for k in ("slip_suffix", "origin", "dest", "dest_code", "ptype", "swapped", "paid"):
             st.session_state.pop(k, None)
         st.rerun()
