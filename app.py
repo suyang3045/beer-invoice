@@ -24,6 +24,7 @@ EMPTY_TYPES = ["상차", "공차"]
 VAT_RATE = 0.1
 EMPTY_ROWS = 5
 DEFAULT_ORIGIN = "강원공장"
+CONTAINER_PREFIX = "201"
 
 
 # ───────────────────────── 공통 ─────────────────────────
@@ -142,37 +143,47 @@ def page_entry():
     slip_suffix = c2.text_input(f"전표번호  ({inv_date:%Y%m}_ 뒤)", key="slip_suffix")
 
     # 출발지 / 도착지 / 도착지 코드 (기존 프로그램과 같은 방식)
-    origins = sorted(dests["origin"].dropna().unique().tolist())
-    dest_names = sorted(dests["dest"].dropna().unique().tolist())
-    origin_idx = origins.index(DEFAULT_ORIGIN) if DEFAULT_ORIGIN in origins else None
+    # 용기·환입을 고르면 출발지↔도착지가 화면에서 바뀌고, 단가는 바뀌기 전 도착지 기준으로 찾는다.
+    places = sorted(set(dests["origin"].dropna()) | set(dests["dest"].dropna()))
+    origin_idx = places.index(DEFAULT_ORIGIN) if DEFAULT_ORIGIN in places else None
+    ss = st.session_state
 
     def on_dest_code():
-        code = st.session_state.get("dest_code", "").strip().split(".")[0]
+        code = ss.get("dest_code", "").strip().split(".")[0]
         hit = dests[dests["code"] == code]
         if hit.empty:
-            st.session_state.code_msg = f"도착지 코드 {code} 를 찾을 수 없습니다."
-        else:
-            st.session_state.origin = hit.iloc[0]["origin"]
-            st.session_state.dest = hit.iloc[0]["dest"]
+            ss.code_msg = f"도착지 코드 {code} 를 찾을 수 없습니다."
+            return
+        o, d = hit.iloc[0]["origin"], hit.iloc[0]["dest"]
+        ss.origin, ss.dest = (d, o) if ss.get("swapped") else (o, d)
+
+    def on_type_change():
+        want = ss.get("ptype") in SWAP_TYPES
+        if want != ss.get("swapped", False):
+            if ss.get("origin") and ss.get("dest"):
+                ss.origin, ss.dest = ss.dest, ss.origin
+            ss.swapped = want
 
     c1, c2, c3, c4, c5, c6 = st.columns([1.3, 1.3, 1, 1, 1, 1])
-    origin = c1.selectbox("출발지", origins, index=origin_idx, placeholder="선택", key="origin")
-    dest = c2.selectbox("도착지", dest_names, index=None, placeholder="선택 또는 입력", key="dest")
+    origin = c1.selectbox("출발지", places, index=origin_idx, placeholder="선택", key="origin")
+    dest = c2.selectbox("도착지", places, index=None, placeholder="선택 또는 입력", key="dest")
     c3.text_input("도착지 코드", key="dest_code", on_change=on_dest_code, placeholder="코드 입력 후 Enter")
-    product_type = c4.selectbox("제품구분", PRODUCT_TYPES)
+    product_type = c4.selectbox("제품구분", PRODUCT_TYPES, key="ptype", on_change=on_type_change)
     unload_type = c5.selectbox("하차구분", UNLOAD_TYPES)
     empty_type = c6.selectbox("공차구분", EMPTY_TYPES)
-    if msg := st.session_state.pop("code_msg", None):
+    if msg := ss.pop("code_msg", None):
         st.warning(msg)
 
-    price_dest = dest  # 단가는 선택한 도착지 기준
-    if origin and dest and product_type in SWAP_TYPES:
-        origin, dest = dest, origin
-        st.caption(f"{product_type}: {origin} → {dest} 로 저장하고, 단가는 {price_dest} 기준으로 적용합니다.")
+    swapped = ss.get("swapped", False)
+    price_dest = origin if swapped else dest  # 단가는 원래(바뀌기 전) 도착지 기준
+    if swapped and origin and dest:
+        st.caption(f"{product_type}: 출발지와 도착지를 바꿨습니다. 단가는 {price_dest} 기준으로 적용합니다.")
 
     # 제품 입력
     st.subheader("제품")
     product_labels = [f"{r.product_code} - {r.product_name}" for r in products.itertuples()]
+    if product_type == "용기":  # 용기는 201로 시작하는 코드를 먼저 보여 준다
+        product_labels.sort(key=lambda l: (not l.startswith(CONTAINER_PREFIX), l))
     ver = st.session_state.setdefault("editor_ver", 0)
     edited = st.data_editor(
         pd.DataFrame({"제품": pd.Series([""] * EMPTY_ROWS, dtype="object"),
@@ -260,7 +271,7 @@ def page_entry():
 
         st.session_state.flash = f"{serial} 저장 완료 (합계 {won(total)}원)"
         st.session_state.editor_ver += 1
-        for k in ("slip_suffix", "dest", "dest_code", "paid"):
+        for k in ("slip_suffix", "origin", "dest", "dest_code", "ptype", "swapped", "paid"):
             st.session_state.pop(k, None)
         st.rerun()
 
