@@ -304,6 +304,38 @@ def logout():
     st.rerun()
 
 
+APP_URL = "https://suyang-beer.streamlit.app"
+
+
+def personal_url():
+    base = str(secret("APP_URL", APP_URL)).rstrip("/")
+    tok = st.session_state.get("token")
+    return f"{base}/?embed=true" + (f"&t={tok}" if tok else "")
+
+
+@st.dialog("📲 바로가기 만들기")
+def shortcut_dialog():
+    url = personal_url()
+    if st.session_state.get("token"):
+        st.success("자동 로그인이 들어간 내 전용 바로가기입니다. 다른 사람에게 보내지 마세요.")
+    else:
+        st.warning("지금은 자동 로그인 없이 로그인했습니다. 바로가기를 열 때마다 로그인해야 합니다. "
+                   "자동 로그인을 원하면 로그아웃 후 '로그인 상태 유지'를 체크해서 다시 로그인하세요.")
+
+    st.markdown("**💻 PC (윈도우)**")
+    url_file = f"[InternetShortcut]\r\nURL={url}\r\n"
+    st.download_button("바탕화면 바로가기 파일 받기", url_file.encode("utf-8"), file_name="맥주 운송전표.url",
+                       mime="application/internet-shortcut", use_container_width=True)
+    st.caption("받은 '맥주 운송전표.url' 파일을 바탕화면으로 옮기면 더블클릭으로 바로 열립니다.")
+
+    st.markdown("**📱 휴대폰**")
+    st.caption("아래 주소 오른쪽의 복사 버튼을 누른 뒤, 휴대폰 브라우저 주소창에 붙여 넣어 여세요. 그다음:")
+    st.code(url, language=None)
+    st.markdown("- **안드로이드(크롬)**: 오른쪽 위 **⋮** → **홈 화면에 추가**\n"
+                "- **아이폰(사파리)**: 아래 **공유(□↑)** → **홈 화면에 추가**")
+    st.caption("지금 이 기기에서 만들 때는 주소를 복사할 필요 없이, 브라우저 메뉴에서 바로 '홈 화면에 추가'를 누르면 됩니다.")
+
+
 def account_menu():
     u = me()
     with st.popover(f"👤 {u['name']}", use_container_width=True):
@@ -311,6 +343,8 @@ def account_menu():
         if st.session_state.get("token"):
             st.caption("자동 로그인 사용 중입니다. 지금 주소를 휴대폰 홈 화면에 추가하면 바로 열립니다. "
                        "이 주소는 다른 사람에게 보내지 마세요.")
+        if st.button("📲 바로가기 만들기", use_container_width=True):
+            shortcut_dialog()
         if st.button("로그아웃", use_container_width=True):
             logout()
         if st.button("🔄 기준정보 새로고침", use_container_width=True):
