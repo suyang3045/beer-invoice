@@ -794,6 +794,10 @@ def page_list():
         "수량": items["qty"].map(lambda v: f"{v:,.0f}"),
         "단가": items["unit_price"].map(lambda v: f"{v:,.2f}"),
         "운반비": items["fee"].map(lambda v: f"{v:,.0f}"),
+        # 전표별 합계운반비: 전표의 첫 줄에만 표시
+        "전표 합계": pd.Series([f"{t:,.0f}" if first else "" for t, first in zip(
+            items.groupby("serial_no")["fee"].transform("sum"), ~items["serial_no"].duplicated())],
+            index=items.index),
         "결제": items["paid_date"].fillna("").map(lambda d: f"✅ {d}" if d else "미결제"),
         "일련번호": items["serial_no"],
     })
