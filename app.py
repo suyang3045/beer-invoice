@@ -23,6 +23,7 @@ UNLOAD_TYPES = ["당일착", "익일착"]
 EMPTY_TYPES = ["상차", "공차"]
 VAT_RATE = 0.1
 EMPTY_ROWS = 5
+DEFAULT_ORIGIN = "강원공장"
 
 
 # ───────────────────────── 공통 ─────────────────────────
@@ -136,30 +137,46 @@ def page_entry():
     partner = partners.iloc[labels.index(sel)]
 
     # 기본 정보
-    c1, c2, c3, c4, c5 = st.columns([1.2, 1.5, 1, 1, 1])
+    c1, c2 = st.columns([1, 2])
     inv_date = c1.date_input("작성일자", value=date.today(), format="YYYY-MM-DD")
     slip_suffix = c2.text_input(f"전표번호  ({inv_date:%Y%m}_ 뒤)", key="slip_suffix")
-    product_type = c3.selectbox("제품구분", PRODUCT_TYPES)
-    unload_type = c4.selectbox("하차구분", UNLOAD_TYPES)
-    empty_type = c5.selectbox("공차구분", EMPTY_TYPES)
 
-    route_labels = [f"{r.code} | {r.origin} → {r.dest}" for r in dests.itertuples()]
-    route = st.selectbox("목적지 (코드나 지명으로 검색)", route_labels, index=None,
-                         placeholder="예: 101 또는 원주", key="route")
-    origin = dest = price_dest = None
-    if route:
-        r = dests.iloc[route_labels.index(route)]
-        origin, dest, price_dest = r.origin, r.dest, r.dest
-        if product_type in SWAP_TYPES:
-            origin, dest = dest, origin
-            st.caption(f"{product_type}: {origin} → {dest} 로 저장하고, 단가는 {price_dest} 기준으로 적용합니다.")
+    # 출발지 / 도착지 / 도착지 코드 (기존 프로그램과 같은 방식)
+    origins = sorted(dests["origin"].dropna().unique().tolist())
+    dest_names = sorted(dests["dest"].dropna().unique().tolist())
+    origin_idx = origins.index(DEFAULT_ORIGIN) if DEFAULT_ORIGIN in origins else None
+
+    def on_dest_code():
+        code = st.session_state.get("dest_code", "").strip().split(".")[0]
+        hit = dests[dests["code"] == code]
+        if hit.empty:
+            st.session_state.code_msg = f"도착지 코드 {code} 를 찾을 수 없습니다."
+        else:
+            st.session_state.origin = hit.iloc[0]["origin"]
+            st.session_state.dest = hit.iloc[0]["dest"]
+
+    c1, c2, c3, c4, c5, c6 = st.columns([1.3, 1.3, 1, 1, 1, 1])
+    origin = c1.selectbox("출발지", origins, index=origin_idx, placeholder="선택", key="origin")
+    dest = c2.selectbox("도착지", dest_names, index=None, placeholder="선택 또는 입력", key="dest")
+    c3.text_input("도착지 코드", key="dest_code", on_change=on_dest_code, placeholder="코드 입력 후 Enter")
+    product_type = c4.selectbox("제품구분", PRODUCT_TYPES)
+    unload_type = c5.selectbox("하차구분", UNLOAD_TYPES)
+    empty_type = c6.selectbox("공차구분", EMPTY_TYPES)
+    if msg := st.session_state.pop("code_msg", None):
+        st.warning(msg)
+
+    price_dest = dest  # 단가는 선택한 도착지 기준
+    if origin and dest and product_type in SWAP_TYPES:
+        origin, dest = dest, origin
+        st.caption(f"{product_type}: {origin} → {dest} 로 저장하고, 단가는 {price_dest} 기준으로 적용합니다.")
 
     # 제품 입력
     st.subheader("제품")
     product_labels = [f"{r.product_code} - {r.product_name}" for r in products.itertuples()]
     ver = st.session_state.setdefault("editor_ver", 0)
     edited = st.data_editor(
-        pd.DataFrame({"제품": [None] * EMPTY_ROWS, "수량": [None] * EMPTY_ROWS}),
+        pd.DataFrame({"제품": pd.Series([""] * EMPTY_ROWS, dtype="object"),
+                      "수량": pd.Series([float("nan")] * EMPTY_ROWS, dtype="float64")}),
         column_config={
             "제품": st.column_config.SelectboxColumn("제품코드 - 제품명", options=product_labels, width="large"),
             "수량": st.column_config.NumberColumn("수량", min_value=0, step=1),
@@ -170,7 +187,7 @@ def page_entry():
     items, missing = [], []
     for row in edited.itertuples(index=False):
         label, qty = row[0], row[1]
-        if not label or pd.isna(qty) or qty == 0:
+        if not isinstance(label, str) or not label or pd.isna(qty) or qty == 0:
             continue
         code, name = label.split(" - ", 1)
         price = lookup_price(prices, name, price_dest, inv_date) if price_dest else None
@@ -205,8 +222,8 @@ def page_entry():
     m6.metric("미결제액", won(max(0, prev + total - paid)))
 
     if st.button("💾 저장", type="primary", use_container_width=True):
-        if not route:
-            st.error("목적지를 선택하세요.")
+        if not origin or not dest:
+            st.error("출발지와 도착지를 선택하세요.")
             return
         if not items:
             st.error("제품과 수량을 한 줄 이상 입력하세요.")
@@ -243,7 +260,7 @@ def page_entry():
 
         st.session_state.flash = f"{serial} 저장 완료 (합계 {won(total)}원)"
         st.session_state.editor_ver += 1
-        for k in ("slip_suffix", "route", "paid"):
+        for k in ("slip_suffix", "dest", "dest_code", "paid"):
             st.session_state.pop(k, None)
         st.rerun()
 
