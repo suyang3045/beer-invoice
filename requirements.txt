@@ -1,0 +1,5 @@
+streamlit>=1.42
+pandas>=2.0
+sqlalchemy>=2.0
+psycopg2-binary
+openpyxl
