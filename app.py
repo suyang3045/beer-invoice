@@ -9,7 +9,7 @@ import re
 import secrets as pysecrets
 import io
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -17,6 +17,18 @@ from sqlalchemy import inspect as sa_inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from db import DEFAULT_PARTNER, make_engine
+
+KST = timezone(timedelta(hours=9))  # 한국 시간 (서머타임 없음)
+
+
+def now_kst():
+    """서버(Streamlit Cloud)는 미국 시간이라, 날짜·시간은 항상 한국 시간으로 계산."""
+    return datetime.now(KST).replace(tzinfo=None)
+
+
+def today_kst():
+    return now_kst().date()
+
 
 st.set_page_config(page_title="맥주 운송전표", page_icon="🍺", layout="wide", initial_sidebar_state="collapsed")
 
@@ -222,7 +234,7 @@ def issue_token(user_id):
     tok = pysecrets.token_urlsafe(24)
     with engine().begin() as conn:
         conn.execute(text("INSERT INTO login_tokens (token, user_id, expires) VALUES (:t, :u, :e)"),
-                     {"t": tok, "u": user_id, "e": (date.today() + timedelta(days=KEEP_DAYS)).isoformat()})
+                     {"t": tok, "u": user_id, "e": (today_kst() + timedelta(days=KEEP_DAYS)).isoformat()})
     st.query_params["t"] = tok
     st.session_state.token = tok
 
@@ -236,7 +248,7 @@ def login():
         row = q("""SELECT u.user_id, u.name, u.is_admin FROM login_tokens t
                    JOIN users u ON u.user_id = t.user_id
                    WHERE t.token = :t AND t.expires >= :today AND u.active = 1""",
-                t=tok, today=date.today().isoformat())
+                t=tok, today=today_kst().isoformat())
         if not row.empty:
             st.session_state.user = {"user_id": row.user_id[0], "name": row.name[0],
                                      "is_admin": bool(row.is_admin[0])}
@@ -269,7 +281,7 @@ def login():
                         conn.execute(text("""INSERT INTO users (user_id, name, pw_hash, is_admin, active, created_at)
                                              VALUES (:u, :n, :h, 1, 1, :c)"""),
                                      {"u": uid.strip(), "n": name.strip() or uid.strip(), "h": hash_pw(pw1),
-                                      "c": datetime.now().isoformat(timespec="seconds")})
+                                      "c": now_kst().isoformat(timespec="seconds")})
                         conn.execute(text("UPDATE invoices SET created_by = :u WHERE created_by IS NULL"),
                                      {"u": uid.strip()})
                     st.session_state.user = {"user_id": uid.strip(), "name": name.strip() or uid.strip(),
@@ -407,7 +419,7 @@ def page_users():
                         conn.execute(text("""INSERT INTO users (user_id, name, pw_hash, is_admin, active, created_at)
                                              VALUES (:u, :n, :h, :a, 1, :c)"""),
                                      {"u": uid.strip(), "n": name.strip() or uid.strip(), "h": hash_pw(pw1),
-                                      "a": 1 if adm else 0, "c": datetime.now().isoformat(timespec="seconds")})
+                                      "a": 1 if adm else 0, "c": now_kst().isoformat(timespec="seconds")})
                     st.session_state.flash = f"{uid.strip()} 사용자를 만들었습니다."
                     st.rerun()
                 except IntegrityError:
@@ -470,7 +482,11 @@ def page_entry():
 
     # 기본 정보
     c1, c2 = st.columns([1, 2])
-    inv_date = c1.date_input("작성일자", value=date.today(), format="YYYY-MM-DD")
+    # 접속할 때마다 오늘(한국 시간)로 시작하고, 필요하면 사용자가 바꿀 수 있음
+    if st.session_state.get("inv_date_day") != today_kst():
+        st.session_state.inv_date = today_kst()
+        st.session_state.inv_date_day = today_kst()
+    inv_date = c1.date_input("작성일자", key="inv_date", format="YYYY-MM-DD")
     slip_suffix = c2.text_input(f"전표번호  ({inv_date:%Y%m}_ 뒤 6자리까지)", key="slip_suffix", max_chars=6,
                                 placeholder="번호 입력 후 Enter")
     if not slip_suffix.strip():
@@ -615,7 +631,7 @@ def page_entry():
                         "origin": origin, "dest": dest, "product_type": product_type,
                         "unload_type": unload_type, "empty_type": empty_type,
                         "fee_total": fee_total, "vat": vat, "total": total, "paid": 0.0,
-                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                        "created_at": now_kst().isoformat(timespec="seconds"),
                         "created_by": me().get("user_id"),
                     })
                     conn.execute(text("""
@@ -783,7 +799,7 @@ def page_list():
         st.success(msg)
     partners = load_partners()
     c1, c2, c3 = st.columns(3)
-    today = date.today()
+    today = today_kst()
     d_from = c1.date_input("시작일", value=today.replace(day=1), format="YYYY-MM-DD")
     d_to = c2.date_input("종료일", value=today, format="YYYY-MM-DD")
     who = c3.selectbox("거래처", ["전체"] + partners["name"].tolist())
@@ -992,7 +1008,7 @@ def page_payments():
     if not months:
         st.info("저장된 전표가 없습니다.")
         return
-    last_month = (date.today().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    last_month = (today_kst().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
     c1, c2, c3 = st.columns(3)
     ym = c1.selectbox("대상 월 (전표 작성월)", months,
                       index=months.index(last_month) if last_month in months else 0)
