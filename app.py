@@ -277,8 +277,126 @@ def page_entry():
 
 
 # ───────────────────────── 전표 조회 ─────────────────────────
+def _s(v):
+    return "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
+
+
+def _pick(label, options, current, key):
+    opts = list(options)
+    if current and current not in opts:
+        opts = [current] + opts
+    idx = opts.index(current) if current in opts else None
+    return st.selectbox(label, opts, index=idx, key=key)
+
+
+def edit_invoice(serial, inv):
+    """원본 인수증과 다를 때 전표 머리글과 제품 줄을 고쳐 저장한다."""
+    k = f"edit_{serial}_"
+    dests, partners = load_destinations(), load_partners()
+    places = sorted(set(dests["origin"].dropna()) | set(dests["dest"].dropna()))
+
+    c1, c2, c3 = st.columns(3)
+    new_date = c1.date_input("작성일자", value=date.fromisoformat(inv.invoice_date),
+                             format="YYYY-MM-DD", key=k + "date")
+    new_slip = c2.text_input("전표번호", value=inv.slip_no or "", key=k + "slip")
+    new_partner = _pick("거래처", partners["name"].tolist(), inv.partner_name, k + "partner")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    new_origin = _pick("출발지", places, inv.origin, k + "origin")
+    new_dest = _pick("도착지", places, inv.dest, k + "dest")
+    new_ptype = _pick("제품구분", PRODUCT_TYPES, inv.product_type, k + "ptype")
+    new_unload = _pick("하차구분", UNLOAD_TYPES, inv.unload_type, k + "unload")
+    new_empty = _pick("공차구분", EMPTY_TYPES, inv.empty_type, k + "empty")
+
+    old = q("""SELECT product_code, product_name, qty, unit_price
+               FROM invoice_items WHERE serial_no = :s ORDER BY id""", s=serial)
+    old_label = [f"{_s(r.product_code)} - {_s(r.product_name)}" for r in old.itertuples()]
+    old_price = dict(zip(old_label, old["unit_price"]))
+    options = [f"{r.product_code} - {r.product_name}" for r in load_products().itertuples()]
+    options += [l for l in old_label if l not in options]
+
+    st.caption("제품과 수량만 고칠 수 있습니다. 저장된 제품의 단가는 그대로 유지되고, 새로 추가한 제품만 단가표에서 자동 적용됩니다.")
+    edited = st.data_editor(
+        pd.DataFrame({"제품": old_label, "수량": old["qty"].astype("float64")}),
+        num_rows="dynamic", hide_index=True, use_container_width=True, key=k + "items",
+        column_config={
+            "제품": st.column_config.SelectboxColumn("제품코드 - 제품명", options=options, width="large"),
+            "수량": st.column_config.NumberColumn(min_value=0, step=1),
+        },
+    )
+
+    # 용기·환입은 출발지/도착지가 바뀌어 저장되어 있으므로 단가는 출발지(원래 도착지) 기준
+    price_dest = new_origin if new_ptype in SWAP_TYPES else new_dest
+    prices = load_prices()
+    rows, missing = [], []
+    for r in edited.itertuples(index=False):
+        label, qty = r[0], r[1]
+        if not isinstance(label, str) or not label or pd.isna(qty) or qty == 0:
+            continue
+        code, name = label.split(" - ", 1)
+        price = old_price.get(label)  # 이미 저장된 제품은 원래 단가를 절대 바꾸지 않음
+        if price is None:  # 새로 추가한 제품만 단가표에서 찾음
+            price = lookup_price(prices, name, price_dest, new_date) if price_dest else None
+            if price is None:
+                missing.append(name)
+                price = 0.0
+        rows.append({"product_code": code, "product_name": name, "qty": float(qty),
+                     "unit_price": float(price), "fee": float(round(qty * price))})
+    if rows:
+        st.dataframe(pd.DataFrame(rows).rename(columns={
+            "product_code": "제품코드", "product_name": "제품명", "qty": "수량",
+            "unit_price": "단가", "fee": "운반비"}).style.format(
+            {"수량": "{:,.0f}", "단가": "{:,.0f}", "운반비": "{:,.0f}"}),
+            hide_index=True, use_container_width=True)
+    if missing:
+        st.warning(f"단가표에 없는 제품: {', '.join(missing)} ({price_dest}, {new_date} 기준) — 0원으로 계산됩니다.")
+
+    fee_total = sum(x["fee"] for x in rows)
+    vat = round(fee_total * VAT_RATE)
+    total = fee_total + vat
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("운반비", won(fee_total), delta=won(fee_total - inv.fee_total) if fee_total != inv.fee_total else None)
+    m2.metric("부가세", won(vat))
+    m3.metric("합계", won(total))
+    new_paid = m4.number_input("결제완료", min_value=0.0, value=float(inv.paid or 0), step=10000.0, key=k + "paid")
+
+    b1, b2 = st.columns([3, 1])
+    if b1.button("✏️ 수정 내용 저장", type="primary", use_container_width=True, key=k + "save"):
+        if not rows:
+            st.error("제품 줄이 하나 이상 있어야 합니다. 전표를 없애려면 삭제를 이용하세요.")
+            return
+        biz = partners.loc[partners["name"] == new_partner, "biz_no"]
+        with engine().begin() as conn:
+            conn.execute(text("""UPDATE invoices SET invoice_date=:d, slip_no=:slip, partner_name=:pn,
+                                    biz_no=:bn, origin=:o, dest=:de, product_type=:pt, unload_type=:ut,
+                                    empty_type=:et, fee_total=:f, vat=:v, total=:t, paid=:p
+                                 WHERE serial_no=:s"""), {
+                "d": new_date.isoformat(), "slip": new_slip.strip(), "pn": new_partner,
+                "bn": biz.iloc[0] if not biz.empty else inv.biz_no, "o": new_origin, "de": new_dest,
+                "pt": new_ptype, "ut": new_unload, "et": new_empty,
+                "f": fee_total, "v": vat, "t": total, "p": float(new_paid), "s": serial})
+            conn.execute(text("DELETE FROM invoice_items WHERE serial_no = :s"), {"s": serial})
+            conn.execute(text("""INSERT INTO invoice_items (serial_no, product_code, product_name, qty, unit_price, fee)
+                                 VALUES (:serial_no, :product_code, :product_name, :qty, :unit_price, :fee)"""),
+                         [{**x, "serial_no": serial} for x in rows])
+        st.session_state.flash = f"{serial} 수정 완료"
+        st.rerun()
+
+    with b2.popover("🗑️ 삭제", use_container_width=True):
+        st.write(f"{serial} 전표를 완전히 삭제할까요?")
+        if st.button("삭제 확인", type="primary", key=k + "del"):
+            with engine().begin() as conn:
+                conn.execute(text("DELETE FROM invoice_items WHERE serial_no = :s"), {"s": serial})
+                conn.execute(text("DELETE FROM invoices WHERE serial_no = :s"), {"s": serial})
+            st.session_state.flash = f"{serial} 삭제 완료"
+            st.rerun()
+
+
 def page_list():
     st.header("전표 조회")
+    if msg := st.session_state.pop("flash", None):
+        st.success(msg)
     partners = load_partners()
     c1, c2, c3 = st.columns(3)
     today = date.today()
@@ -328,19 +446,12 @@ def page_list():
         st.success("저장했습니다.")
         st.rerun()
 
-    # 상세 / 삭제
-    st.subheader("전표 상세")
-    serial = st.selectbox("일련번호", df.serial_no.tolist(), index=None)
+    # 상세 / 수정 / 삭제
+    st.subheader("전표 상세 · 수정")
+    serial = st.selectbox("일련번호", df.serial_no.tolist(), index=None,
+                          placeholder="수정하거나 볼 전표를 고르세요")
     if serial:
-        items = q("""SELECT product_code AS 제품코드, product_name AS 제품명, qty AS 수량,
-                            unit_price AS 단가, fee AS 운반비
-                     FROM invoice_items WHERE serial_no = :s ORDER BY id""", s=serial)
-        st.dataframe(items, hide_index=True, use_container_width=True)
-        if st.checkbox(f"{serial} 삭제") and st.button("삭제 확인", type="secondary"):
-            with engine().begin() as conn:
-                conn.execute(text("DELETE FROM invoice_items WHERE serial_no = :s"), {"s": serial})
-                conn.execute(text("DELETE FROM invoices WHERE serial_no = :s"), {"s": serial})
-            st.rerun()
+        edit_invoice(serial, df[df.serial_no == serial].iloc[0])
 
     # 엑셀 다운로드
     all_items = q(f"""SELECT i.* FROM invoice_items i JOIN invoices v ON v.serial_no = i.serial_no
@@ -425,9 +536,159 @@ def page_admin():
                      hide_index=True, use_container_width=True)
 
 
+# ───────────────────────── 단가 변경 (유가 연동) ─────────────────────────
+FUEL_FACTOR = 0.45      # 단가변동율 = (변동유가 - 기준유가) / 기준유가 × 45%
+FUEL_THRESHOLD = 100    # 기준유가와 100원 이상 차이 나는 분기가 나오면 변경
+
+
+@st.cache_resource
+def ensure_fuel_table():
+    with engine().begin() as conn:
+        conn.execute(text("""CREATE TABLE IF NOT EXISTS fuel_prices (
+                                 year INTEGER NOT NULL, quarter INTEGER NOT NULL,
+                                 price DOUBLE PRECISION NOT NULL,
+                                 PRIMARY KEY (year, quarter))"""))
+    return True
+
+
+def quarter_of(d: date):
+    return d.year, (d.month - 1) // 3 + 1
+
+
+def prev_quarter(y, qt):
+    return (y, qt - 1) if qt > 1 else (y - 1, 4)
+
+
+def next_quarter(y, qt):
+    return (y, qt + 1) if qt < 4 else (y + 1, 1)
+
+
+def quarter_start(y, qt):
+    return date(y, 3 * (qt - 1) + 1, 1)
+
+
+def qlabel(y, qt):
+    m = 3 * (qt - 1) + 1
+    return f"{y}년 {qt}분기({m}~{m + 2}월)"
+
+
+def round_price(x, mode):
+    from decimal import Decimal, ROUND_HALF_UP
+    unit = {"원 단위": Decimal("1"), "10원 단위": Decimal("10"), "소수 첫째 자리": Decimal("0.1")}[mode]
+    return float((Decimal(str(x)) / unit).quantize(Decimal("1"), ROUND_HALF_UP) * unit)
+
+
+def page_price_change():
+    st.header("단가 변경 (유가 연동)")
+    ensure_fuel_table()
+    if msg := st.session_state.pop("flash", None):
+        st.success(msg)
+
+    # 1) 분기별 경유 평균가
+    st.subheader("① 분기별 자동차용 경유 평균가")
+    st.caption("오피넷(www.opinet.co.kr) → 유가통계에서 분기별 자동차용 경유 평균가를 확인해 입력하세요. "
+               "엑셀에서 복사해 표에 붙여넣기(Ctrl+V)도 됩니다.")
+    fuel = q("SELECT year AS 연도, quarter AS 분기, price AS 경유평균가 FROM fuel_prices ORDER BY year, quarter")
+    fuel = fuel.astype({"연도": "Int64", "분기": "Int64", "경유평균가": "float64"})
+    fuel_edit = st.data_editor(
+        fuel, num_rows="dynamic", hide_index=True, key="fuel_editor",
+        column_config={
+            "연도": st.column_config.NumberColumn(min_value=2000, max_value=2100, step=1, format="%d"),
+            "분기": st.column_config.NumberColumn(min_value=1, max_value=4, step=1, format="%d"),
+            "경유평균가": st.column_config.NumberColumn(min_value=0, format="%.2f"),
+        },
+    )
+    if st.button("유가 저장"):
+        clean = fuel_edit.dropna()
+        if clean.duplicated(["연도", "분기"]).any():
+            st.error("같은 연도·분기가 두 번 입력되어 있습니다.")
+        else:
+            with engine().begin() as conn:
+                conn.execute(text("DELETE FROM fuel_prices"))
+                if not clean.empty:
+                    conn.execute(text("INSERT INTO fuel_prices (year, quarter, price) VALUES (:y, :q, :p)"),
+                                 [{"y": int(r.연도), "q": int(r.분기), "p": float(r.경유평균가)}
+                                  for r in clean.itertuples(index=False)])
+            st.session_state.flash = "유가를 저장했습니다."
+            st.rerun()
+
+    fuel_map = {(int(r.연도), int(r.분기)): float(r.경유평균가) for r in fuel.dropna().itertuples(index=False)}
+
+    # 2) 변경 판단
+    st.subheader("② 단가 변경 판단")
+    prices = q("SELECT apply_date, product_code, product_name, dest, price FROM unit_prices")
+    if prices.empty:
+        st.info("단가표가 비어 있습니다.")
+        return
+    last_apply = date.fromisoformat(prices["apply_date"].max())
+    base_q = prev_quarter(*quarter_of(last_apply))
+    st.write(f"현재 단가의 최근 적용일: **{last_apply}**  →  기준유가 분기: **{qlabel(*base_q)}**")
+    if base_q not in fuel_map:
+        st.warning(f"{qlabel(*base_q)} 경유 평균가가 없습니다. 위 표에 먼저 입력하세요.")
+        return
+    base = fuel_map[base_q]
+
+    rows, trigger = [], None
+    cur = next_quarter(*base_q)
+    while cur in fuel_map:
+        diff = fuel_map[cur] - base
+        hit = abs(diff) >= FUEL_THRESHOLD
+        rows.append({"분기": qlabel(*cur), "경유평균가": fuel_map[cur], "기준유가 대비": diff,
+                     "판정": "변경" if hit else "100원 미만"})
+        if hit:
+            trigger = cur
+            break
+        cur = next_quarter(*cur)
+
+    st.write(f"기준유가: **{base:,.2f}원**")
+    if rows:
+        st.dataframe(pd.DataFrame(rows).style.format({"경유평균가": "{:,.2f}", "기준유가 대비": "{:+,.2f}"}),
+                     hide_index=True, use_container_width=True)
+    if not trigger:
+        st.info(f"기준유가와 {FUEL_THRESHOLD}원 이상 차이 나는 분기가 아직 없습니다. 단가 변경 대상이 아닙니다.")
+        return
+
+    new_fuel = fuel_map[trigger]
+    rate = (new_fuel - base) / base * FUEL_FACTOR
+    apply_date = quarter_start(*next_quarter(*trigger))
+    st.success(f"{qlabel(*trigger)} 경유가 {new_fuel:,.2f}원 → 단가변동율 "
+               f"({new_fuel:,.2f} − {base:,.2f}) ÷ {base:,.2f} × 45 = **{rate * 100:+.3f}%**, "
+               f"적용일자 **{apply_date}**")
+
+    # 3) 새 단가 미리보기
+    st.subheader("③ 새 단가 미리보기")
+    mode = st.radio("단가 반올림", ["원 단위", "10원 단위", "소수 첫째 자리"], horizontal=True)
+    latest = (prices[prices["apply_date"] < apply_date.isoformat()]
+              .sort_values("apply_date")
+              .groupby(["product_name", "dest"], as_index=False).last())
+    latest["새단가"] = [round_price(p * (1 + rate), mode) for p in latest["price"]]
+    latest["차이"] = latest["새단가"] - latest["price"]
+    view = latest.rename(columns={"product_code": "제품코드", "product_name": "제품명", "dest": "도착지",
+                                  "apply_date": "기존 적용일", "price": "현재단가"})[
+        ["제품코드", "제품명", "도착지", "기존 적용일", "현재단가", "새단가", "차이"]]
+    st.dataframe(view.style.format({"현재단가": "{:,.2f}", "새단가": "{:,.2f}", "차이": "{:+,.2f}"}),
+                 hide_index=True, use_container_width=True)
+
+    exists = int(q("SELECT COUNT(*) AS n FROM unit_prices WHERE apply_date = :d",
+                   d=apply_date.isoformat()).n[0])
+    if exists:
+        st.warning(f"{apply_date} 적용 단가가 이미 {exists}건 있습니다. 중복 저장을 막기 위해 저장 버튼을 숨겼습니다.")
+        return
+    if st.button(f"💾 새 단가 {len(view)}건 저장 (적용일 {apply_date})", type="primary"):
+        with engine().begin() as conn:
+            conn.execute(text("""INSERT INTO unit_prices (apply_date, product_code, product_name, dest, price)
+                                 VALUES (:a, :c, :n, :d, :p)"""),
+                         [{"a": apply_date.isoformat(), "c": r.product_code, "n": r.product_name,
+                           "d": r.dest, "p": float(r.새단가)} for r in latest.itertuples(index=False)])
+        clear_caches()
+        st.session_state.flash = f"{apply_date} 적용 새 단가 {len(view)}건을 저장했습니다."
+        st.rerun()
+
+
 # ───────────────────────── main ─────────────────────────
 if check_password():
-    page = st.sidebar.radio("메뉴", ["전표 입력", "전표 조회", "단가·거래처 관리"])
+    page = st.sidebar.radio("메뉴", ["전표 입력", "전표 조회", "단가 변경", "단가·거래처 관리"])
     if st.sidebar.button("🔄 기준정보 새로고침"):
         clear_caches()
-    {"전표 입력": page_entry, "전표 조회": page_list, "단가·거래처 관리": page_admin}[page]()
+    {"전표 입력": page_entry, "전표 조회": page_list, "단가 변경": page_price_change,
+     "단가·거래처 관리": page_admin}[page]()
