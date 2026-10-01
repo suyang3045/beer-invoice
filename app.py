@@ -19,6 +19,14 @@ from db import DEFAULT_PARTNER, make_engine
 
 st.set_page_config(page_title="맥주 운송전표", page_icon="🍺", layout="wide")
 
+# 앱 안쪽의 Streamlit 메뉴·장식 숨기기 (사이드바 열기 버튼은 남겨 둠)
+st.markdown("""
+<style>
+#MainMenu, [data-testid="stToolbar"], [data-testid="stDecoration"],
+[data-testid="stStatusWidget"], footer {display: none !important;}
+</style>
+""", unsafe_allow_html=True)
+
 PRODUCT_TYPES = ["제품", "용기", "자재", "일반", "환입"]
 SWAP_TYPES = {"용기", "환입"}  # 출발지/도착지를 바꿔 저장하고, 단가는 원래 도착지 기준
 UNLOAD_TYPES = ["당일착", "익일착"]
