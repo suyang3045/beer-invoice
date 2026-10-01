@@ -3,14 +3,16 @@
 로컬 실행:  streamlit run app.py   (DB_URL이 없으면 local_test.db SQLite 사용)
 배포:       Streamlit Community Cloud + Supabase(PostgreSQL)
 """
+import hashlib
 import hmac
+import re
 import io
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import text
+from sqlalchemy import inspect as sa_inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from db import DEFAULT_PARTNER, make_engine
@@ -115,9 +117,11 @@ def current_product_labels(prices, d: date):
 
 
 def previous_unpaid(partner_name, d: date):
-    df = q("""SELECT COALESCE(SUM(total), 0) AS t, COALESCE(SUM(paid), 0) AS p
-              FROM invoices WHERE partner_name = :n AND invoice_date <= :d""",
-           n=partner_name, d=d.isoformat())
+    """부가세 제외 운반비 기준 미결제 (일반 사용자는 자기 전표만)."""
+    sc, sp = scope("invoices")
+    df = q(f"""SELECT COALESCE(SUM(fee_total), 0) AS t, COALESCE(SUM(paid), 0) AS p
+               FROM invoices WHERE partner_name = :n AND invoice_date <= :d AND {sc}""",
+           n=partner_name, d=d.isoformat(), **sp)
     return max(0.0, float(df.t[0]) - float(df.p[0]))
 
 
@@ -146,19 +150,207 @@ def won(x):
     return f"{x:,.0f}"
 
 
-def check_password():
-    pw = secret("APP_PASSWORD")
-    if not pw or st.session_state.get("authed"):
+# ───────────────────────── 사용자 / 로그인 ─────────────────────────
+@st.cache_resource
+def ensure_auth_schema():
+    eng = engine()
+    with eng.begin() as conn:
+        conn.execute(text("""CREATE TABLE IF NOT EXISTS users (
+                                 user_id TEXT PRIMARY KEY, name TEXT, pw_hash TEXT NOT NULL,
+                                 is_admin INTEGER DEFAULT 0, active INTEGER DEFAULT 1, created_at TEXT)"""))
+    cols = {c["name"] for c in sa_inspect(eng).get_columns("invoices")}
+    for col in ("created_by", "paid_date"):
+        if col not in cols:
+            with eng.begin() as conn:
+                conn.execute(text(f"ALTER TABLE invoices ADD COLUMN {col} TEXT"))
+    return True
+
+
+def hash_pw(pw, salt=None):
+    salt = salt or os.urandom(16).hex()
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000).hex()
+    return f"{salt}${h}"
+
+
+def check_pw(pw, stored):
+    try:
+        salt, h = stored.split("$")
+    except (AttributeError, ValueError):
+        return False
+    return hmac.compare_digest(hash_pw(pw, salt).split("$")[1], h)
+
+
+def me():
+    return st.session_state.get("user") or {}
+
+
+def is_admin():
+    return bool(me().get("is_admin"))
+
+
+def scope(alias="v"):
+    """관리자는 전체, 일반 사용자는 자기가 입력한 전표만."""
+    if is_admin():
+        return "1=1", {}
+    return f"{alias}.created_by = :me_id", {"me_id": me().get("user_id")}
+
+
+ID_RE = re.compile(r"^[A-Za-z]{6}[0-9]{4}$")   # 영문 6자리 + 숫자 4자리 (예: suyang1234)
+PW_RE = re.compile(r"^[0-9]{6}$")              # 숫자 6자리
+ID_HELP = "아이디는 영문 6자리 + 숫자 4자리로 만드세요. (예: suyang1234)"
+PW_HELP = "비밀번호는 숫자 6자리로 만드세요."
+
+
+def login():
+    ensure_auth_schema()
+    if me():
         return True
     st.title("🍺 맥주 운송전표")
+    n_users = int(q("SELECT COUNT(*) AS n FROM users").n[0])
+
+    if n_users == 0:
+        st.info("처음 사용하는 설정입니다. 관리자 계정을 만드세요. 지금까지 저장된 전표는 모두 이 관리자 것으로 정리됩니다.")
+        with st.form("setup"):
+            app_pw = st.text_input("기존 앱 접속 비밀번호 (APP_PASSWORD)", type="password")
+            uid = st.text_input("관리자 아이디 (영문 6자리 + 숫자 4자리)", max_chars=10)
+            name = st.text_input("이름")
+            pw1 = st.text_input("비밀번호 (숫자 6자리)", type="password", max_chars=6)
+            pw2 = st.text_input("비밀번호 확인", type="password", max_chars=6)
+            if st.form_submit_button("관리자 계정 만들기", type="primary"):
+                expected = secret("APP_PASSWORD")
+                if expected and not hmac.compare_digest(app_pw, str(expected)):
+                    st.error("기존 앱 접속 비밀번호가 맞지 않습니다.")
+                elif not ID_RE.match(uid.strip()):
+                    st.error(ID_HELP)
+                elif not PW_RE.match(pw1):
+                    st.error(PW_HELP)
+                elif pw1 != pw2:
+                    st.error("비밀번호 확인이 다릅니다.")
+                else:
+                    with engine().begin() as conn:
+                        conn.execute(text("""INSERT INTO users (user_id, name, pw_hash, is_admin, active, created_at)
+                                             VALUES (:u, :n, :h, 1, 1, :c)"""),
+                                     {"u": uid.strip(), "n": name.strip() or uid.strip(), "h": hash_pw(pw1),
+                                      "c": datetime.now().isoformat(timespec="seconds")})
+                        conn.execute(text("UPDATE invoices SET created_by = :u WHERE created_by IS NULL"),
+                                     {"u": uid.strip()})
+                    st.session_state.user = {"user_id": uid.strip(), "name": name.strip() or uid.strip(),
+                                             "is_admin": True}
+                    st.rerun()
+        return False
+
     with st.form("login"):
-        entered = st.text_input("비밀번호", type="password")
-        if st.form_submit_button("로그인"):
-            if hmac.compare_digest(entered, str(pw)):
-                st.session_state.authed = True
+        uid = st.text_input("아이디")
+        pw = st.text_input("비밀번호 (숫자 6자리)", type="password", max_chars=6)
+        if st.form_submit_button("로그인", type="primary"):
+            row = q("SELECT user_id, name, pw_hash, is_admin FROM users WHERE user_id = :u AND active = 1",
+                    u=uid.strip())
+            if not row.empty and check_pw(pw, row.pw_hash[0]):
+                st.session_state.user = {"user_id": row.user_id[0], "name": row.name[0],
+                                         "is_admin": bool(row.is_admin[0])}
                 st.rerun()
-            st.error("비밀번호가 맞지 않습니다.")
+            st.error("아이디 또는 비밀번호가 맞지 않습니다.")
     return False
+
+
+def sidebar_account():
+    u = me()
+    st.sidebar.markdown(f"👤 **{u['name']}** ({u['user_id']}{', 관리자' if u['is_admin'] else ''})")
+    if st.sidebar.button("로그아웃"):
+        st.session_state.clear()
+        st.rerun()
+    with st.sidebar.expander("비밀번호 변경"):
+        with st.form("chpw", clear_on_submit=True):
+            old = st.text_input("현재 비밀번호", type="password")
+            new1 = st.text_input("새 비밀번호 (숫자 6자리)", type="password", max_chars=6)
+            new2 = st.text_input("새 비밀번호 확인", type="password", max_chars=6)
+            if st.form_submit_button("변경"):
+                row = q("SELECT pw_hash FROM users WHERE user_id = :u", u=u["user_id"])
+                if row.empty or not check_pw(old, row.pw_hash[0]):
+                    st.error("현재 비밀번호가 맞지 않습니다.")
+                elif not PW_RE.match(new1):
+                    st.error(PW_HELP)
+                elif new1 != new2:
+                    st.error("새 비밀번호 확인이 다릅니다.")
+                else:
+                    with engine().begin() as conn:
+                        conn.execute(text("UPDATE users SET pw_hash = :h WHERE user_id = :u"),
+                                     {"h": hash_pw(new1), "u": u["user_id"]})
+                    st.success("변경했습니다.")
+
+
+def page_users():
+    st.header("사용자 관리")
+    if msg := st.session_state.pop("flash", None):
+        st.success(msg)
+    users = q("""SELECT user_id AS 아이디, name AS 이름, is_admin AS 관리자, active AS 사용,
+                        created_at AS 등록일 FROM users ORDER BY created_at""")
+    users["관리자"] = users["관리자"].astype(bool)
+    users["사용"] = users["사용"].astype(bool)
+    counts = q("SELECT created_by, COUNT(*) AS n FROM invoices GROUP BY created_by")
+    users["전표 수"] = users["아이디"].map(dict(zip(counts.created_by, counts.n))).fillna(0).astype(int)
+    st.dataframe(users, hide_index=True, use_container_width=True)
+
+    st.subheader("새 사용자 만들기")
+    with st.form("add_user", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        uid = c1.text_input("아이디 (영문 6자리 + 숫자 4자리)", max_chars=10)
+        name = c2.text_input("이름")
+        c1, c2, c3 = st.columns([2, 2, 1])
+        pw1 = c1.text_input("비밀번호 (숫자 6자리)", type="password", max_chars=6)
+        pw2 = c2.text_input("비밀번호 확인", type="password", max_chars=6)
+        adm = c3.checkbox("관리자")
+        if st.form_submit_button("만들기", type="primary"):
+            if not ID_RE.match(uid.strip()):
+                st.error(ID_HELP)
+            elif not PW_RE.match(pw1):
+                st.error(PW_HELP)
+            elif pw1 != pw2:
+                st.error("비밀번호 확인이 다릅니다.")
+            else:
+                try:
+                    with engine().begin() as conn:
+                        conn.execute(text("""INSERT INTO users (user_id, name, pw_hash, is_admin, active, created_at)
+                                             VALUES (:u, :n, :h, :a, 1, :c)"""),
+                                     {"u": uid.strip(), "n": name.strip() or uid.strip(), "h": hash_pw(pw1),
+                                      "a": 1 if adm else 0, "c": datetime.now().isoformat(timespec="seconds")})
+                    st.session_state.flash = f"{uid.strip()} 사용자를 만들었습니다."
+                    st.rerun()
+                except IntegrityError:
+                    st.error("이미 있는 아이디입니다.")
+
+    st.subheader("사용자 변경")
+    target = st.selectbox("사용자", users["아이디"].tolist(), index=None, placeholder="변경할 사용자 선택")
+    if target:
+        row = users[users["아이디"] == target].iloc[0]
+        admins = int(users[users["관리자"] & users["사용"]].shape[0])
+        c1, c2 = st.columns(2)
+        with c1.form("reset_pw", clear_on_submit=True):
+            npw = st.text_input("새 비밀번호 (숫자 6자리)", type="password", max_chars=6)
+            if st.form_submit_button("비밀번호 초기화"):
+                if not PW_RE.match(npw):
+                    st.error(PW_HELP)
+                else:
+                    with engine().begin() as conn:
+                        conn.execute(text("UPDATE users SET pw_hash = :h WHERE user_id = :u"),
+                                     {"h": hash_pw(npw), "u": target})
+                    st.session_state.flash = f"{target} 비밀번호를 바꿨습니다."
+                    st.rerun()
+        with c2:
+            new_admin = st.checkbox("관리자", value=bool(row["관리자"]), key=f"adm_{target}")
+            new_active = st.checkbox("사용 (끄면 로그인 불가, 기록은 보존)", value=bool(row["사용"]), key=f"act_{target}")
+            if st.button("저장", key=f"save_{target}"):
+                losing_admin = bool(row["관리자"]) and bool(row["사용"]) and not (new_admin and new_active)
+                if losing_admin and admins <= 1:
+                    st.error("관리자가 최소 한 명은 있어야 합니다.")
+                elif target == me()["user_id"] and not new_active:
+                    st.error("자기 자신은 사용 중지할 수 없습니다.")
+                else:
+                    with engine().begin() as conn:
+                        conn.execute(text("UPDATE users SET is_admin = :a, active = :t WHERE user_id = :u"),
+                                     {"a": int(new_admin), "t": int(new_active), "u": target})
+                    st.session_state.flash = f"{target} 설정을 저장했습니다."
+                    st.rerun()
 
 
 # ───────────────────────── 전표 입력 ─────────────────────────
@@ -295,16 +487,9 @@ def page_entry():
     fee_total = sum(i["fee"] for i in items)
     vat = round(fee_total * VAT_RATE)
     total = fee_total + vat
-    prev = previous_unpaid(partner["name"], inv_date)
-
     st.subheader("금액")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("운반비", won(fee_total))
-    m2.metric("부가세", won(vat))
-    m3.metric("합계", won(total))
-    m4.metric("이전 미결제", won(prev))
-    paid = m5.number_input("결제완료", min_value=0, step=10000, key="paid")
-    m6.metric("미결제액", won(max(0, prev + total - paid)))
+    st.metric("운반비", won(fee_total))
+    st.caption("결제는 '결제 관리' 메뉴에서 익월 20일 기준으로 한꺼번에 처리합니다.")
 
     if st.button("💾 저장", type="primary", use_container_width=True):
         if not origin or not dest:
@@ -323,17 +508,18 @@ def page_entry():
                     conn.execute(text("""
                         INSERT INTO invoices (serial_no, invoice_date, slip_no, partner_name, biz_no,
                             origin, dest, product_type, unload_type, empty_type,
-                            fee_total, vat, total, paid, created_at)
+                            fee_total, vat, total, paid, created_at, created_by)
                         VALUES (:serial_no, :invoice_date, :slip_no, :partner_name, :biz_no,
                             :origin, :dest, :product_type, :unload_type, :empty_type,
-                            :fee_total, :vat, :total, :paid, :created_at)"""), {
+                            :fee_total, :vat, :total, :paid, :created_at, :created_by)"""), {
                         "serial_no": serial, "invoice_date": inv_date.isoformat(),
                         "slip_no": f"{inv_date:%Y%m}_{slip_suffix.strip()}",
                         "partner_name": partner["name"], "biz_no": partner["biz_no"],
                         "origin": origin, "dest": dest, "product_type": product_type,
                         "unload_type": unload_type, "empty_type": empty_type,
-                        "fee_total": fee_total, "vat": vat, "total": total, "paid": float(paid),
+                        "fee_total": fee_total, "vat": vat, "total": total, "paid": 0.0,
                         "created_at": datetime.now().isoformat(timespec="seconds"),
+                        "created_by": me().get("user_id"),
                     })
                     conn.execute(text("""
                         INSERT INTO invoice_items (serial_no, product_code, product_name, qty, unit_price, fee)
@@ -346,7 +532,7 @@ def page_entry():
             st.error("일련번호 생성에 실패했습니다. 다시 저장해 주세요.")
             return
 
-        st.session_state.flash = f"{serial} 저장 완료 (합계 {won(total)}원)"
+        st.session_state.flash = f"{serial} 저장 완료 (운반비 {won(fee_total)}원)"
         st.session_state.editor_ver += 1
         st.session_state.cart = []
         for k in ("slip_suffix", "origin", "dest", "dest_code", "ptype", "swapped", "paid"):
@@ -433,11 +619,11 @@ def edit_invoice(serial, inv):
     vat = round(fee_total * VAT_RATE)
     total = fee_total + vat
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("운반비", won(fee_total), delta=won(fee_total - inv.fee_total) if fee_total != inv.fee_total else None)
-    m2.metric("부가세", won(vat))
-    m3.metric("합계", won(total))
-    new_paid = m4.number_input("결제완료", min_value=0.0, value=float(inv.paid or 0), step=10000.0, key=k + "paid")
+    st.metric("운반비", won(fee_total), delta=won(fee_total - inv.fee_total) if fee_total != inv.fee_total else None)
+    is_paid = isinstance(inv.get("paid_date"), str) and bool(inv.get("paid_date"))
+    if is_paid:
+        st.caption(f"이 전표는 {inv.paid_date}에 결제 처리되었습니다. 수정하면 결제 금액도 새 운반비로 맞춰집니다.")
+    new_paid = fee_total if is_paid else float(inv.paid or 0)
 
     b1, b2 = st.columns([3, 1])
     if b1.button("✏️ 수정 내용 저장", type="primary", use_container_width=True, key=k + "save"):
@@ -490,7 +676,7 @@ def delete_item_rows(ids, serials):
             else:
                 f = float(fee[1])
                 vat = round(f * VAT_RATE)
-                conn.execute(text("UPDATE invoices SET fee_total = :f, vat = :v, total = :t WHERE serial_no = :s"),
+                conn.execute(text("UPDATE invoices SET fee_total = :f, vat = :v, total = :t, paid = CASE WHEN paid_date IS NOT NULL THEN :f ELSE paid END WHERE serial_no = :s"),
                              {"f": f, "v": float(vat), "t": f + vat, "s": sn})
 
 
@@ -505,8 +691,16 @@ def page_list():
     d_to = c2.date_input("종료일", value=today, format="YYYY-MM-DD")
     who = c3.selectbox("거래처", ["전체"] + partners["name"].tolist())
 
-    where = "v.invoice_date BETWEEN :a AND :b"
-    params = {"a": d_from.isoformat(), "b": d_to.isoformat()}
+    sc, sp = scope("v")
+    where = f"v.invoice_date BETWEEN :a AND :b AND {sc}"
+    params = {"a": d_from.isoformat(), "b": d_to.isoformat(), **sp}
+    if is_admin():
+        writers = q("SELECT user_id, name FROM users ORDER BY user_id")
+        wlabels = ["전체"] + [f"{r.user_id} ({r.name})" for r in writers.itertuples()]
+        wsel = st.selectbox("작성자 (관리자 전용)", wlabels)
+        if wsel != "전체":
+            where += " AND v.created_by = :w"
+            params["w"] = wsel.split(" (")[0]
     if who != "전체":
         where += " AND v.partner_name = :n"
         params["n"] = who
@@ -515,14 +709,14 @@ def page_list():
         st.info("이 기간에 저장된 전표가 없습니다.")
         return
 
-    s1, s2, s3, s4, s5 = st.columns(5)
+    s1, s2, s3, s4 = st.columns(4)
     s1.metric("전표 수", f"{len(df)}건")
     s2.metric("운반비", won(df.fee_total.sum()))
-    s3.metric("합계(부가세 포함)", won(df.total.sum()))
-    s4.metric("결제완료", won(df.paid.sum()))
-    s5.metric("미결제", won(df.total.sum() - df.paid.sum()))
+    s3.metric("결제완료", won(df.paid.sum()))
+    s4.metric("미결제", won(df.fee_total.sum() - df.paid.sum()))
 
-    items = q(f"""SELECT i.id, v.serial_no, v.invoice_date, v.slip_no, v.origin, v.dest, i.product_code,
+    items = q(f"""SELECT i.id, v.serial_no, v.invoice_date, v.slip_no, v.origin, v.dest, v.created_by, v.paid_date,
+                         i.product_code,
                          i.product_name, i.qty, i.unit_price, i.fee
                   FROM invoice_items i JOIN invoices v ON v.serial_no = i.serial_no
                   WHERE {where} ORDER BY v.invoice_date, v.serial_no, i.id""", **params).reset_index(drop=True)
@@ -537,8 +731,11 @@ def page_list():
         "수량": items["qty"].map(lambda v: f"{v:,.0f}"),
         "단가": items["unit_price"].map(lambda v: f"{v:,.2f}"),
         "운반비": items["fee"].map(lambda v: f"{v:,.0f}"),
+        "결제": items["paid_date"].fillna("").map(lambda d: f"✅ {d}" if d else "미결제"),
         "일련번호": items["serial_no"],
     })
+    if is_admin():
+        view["작성자"] = items["created_by"]
     st.caption("맨 왼쪽 칸을 체크하면 같은 전표의 모든 품목이 함께 선택되고, 아래에 수정·삭제가 나타납니다.")
     ver = ss.setdefault("list_ver", 0)
     edited = st.data_editor(
@@ -592,12 +789,12 @@ def page_list():
         df.rename(columns={"serial_no": "일련번호", "invoice_date": "작성일자", "slip_no": "전표번호",
                            "partner_name": "상호", "biz_no": "사업자번호", "origin": "출발지", "dest": "도착지",
                            "product_type": "제품구분", "unload_type": "하차구분", "empty_type": "공차구분",
-                           "fee_total": "운반비", "vat": "부가세", "total": "합계", "paid": "결제완료"}
-                  ).drop(columns=["created_at"], errors="ignore").to_excel(xw, sheet_name="전표", index=False)
+                           "fee_total": "운반비", "paid": "결제완료", "created_by": "작성자"}
+                  ).drop(columns=["created_at", "vat", "total"], errors="ignore").to_excel(xw, sheet_name="전표", index=False)
         items.drop(columns=["id"]).rename(columns={
             "serial_no": "일련번호", "invoice_date": "날짜", "origin": "출발지", "dest": "도착지",
             "product_code": "제품코드", "product_name": "제품명", "qty": "수량", "unit_price": "단가",
-            "fee": "운반비"}).to_excel(xw, sheet_name="제품내역", index=False)
+            "fee": "운반비", "created_by": "작성자"}).to_excel(xw, sheet_name="제품내역", index=False)
     st.download_button("📥 엑셀로 내려받기", buf.getvalue(), file_name=f"운송전표_{d_from}_{d_to}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -669,6 +866,98 @@ def page_admin():
                                  product_name AS 제품명, dest AS 도착지, price AS 단가
                           FROM unit_prices ORDER BY product_code, dest, apply_date DESC"""),
                      hide_index=True, use_container_width=True)
+
+
+# ───────────────────────── 결제 관리 (익월 20일 일괄결제) ─────────────────────────
+WEEKDAYS = "월화수목금토일"
+
+
+def due_date_for(ym):
+    y, m = map(int, ym.split("-"))
+    y2, m2 = (y, m + 1) if m < 12 else (y + 1, 1)
+    return date(y2, m2, 20)
+
+
+def page_payments():
+    st.header("결제 관리")
+    st.caption("전표 작성월의 운반비는 다음 달 20일에 한꺼번에 결제합니다. "
+               "20일이 휴일이면 결제 처리일을 실제 결제한 날로 바꿔서 처리하세요.")
+    if msg := st.session_state.pop("flash", None):
+        st.success(msg)
+
+    sc, sp = scope("v")
+    months = q(f"SELECT DISTINCT substr(v.invoice_date, 1, 7) AS ym FROM invoices v WHERE {sc} ORDER BY ym DESC",
+               **sp)["ym"].tolist()
+    if not months:
+        st.info("저장된 전표가 없습니다.")
+        return
+    last_month = (date.today().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    c1, c2, c3 = st.columns(3)
+    ym = c1.selectbox("대상 월 (전표 작성월)", months,
+                      index=months.index(last_month) if last_month in months else 0)
+    due = due_date_for(ym)
+    c2.metric("정기 결제일", f"{due} ({WEEKDAYS[due.weekday()]})")
+    pay_date = c3.date_input("결제 처리일", value=due, format="YYYY-MM-DD", key=f"paydate_{ym}")
+    if due.weekday() >= 5:
+        st.warning(f"{due}은(는) {WEEKDAYS[due.weekday()]}요일입니다. 실제 결제한 날로 결제 처리일을 바꾸세요.")
+    else:
+        st.caption("공휴일은 자동으로 알 수 없으니, 20일이 공휴일이면 결제 처리일을 직접 바꾸세요.")
+
+    inv = q(f"""SELECT v.serial_no, v.invoice_date, v.slip_no, v.partner_name, v.fee_total, v.paid,
+                       v.paid_date, v.created_by
+                FROM invoices v WHERE substr(v.invoice_date, 1, 7) = :ym AND {sc}
+                ORDER BY v.partner_name, v.invoice_date""", ym=ym, **sp)
+    inv["done"] = inv["paid_date"].notna() | ((inv["fee_total"] > 0) & (inv["paid"] >= inv["fee_total"]))
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric(f"{ym} 운반비", won(inv.fee_total.sum()))
+    m2.metric("결제완료", won(inv.loc[inv.done, "fee_total"].sum()))
+    m3.metric("미결제", won(inv.loc[~inv.done, "fee_total"].sum()))
+
+    g = inv.groupby("partner_name").agg(전표수=("serial_no", "count"), 운반비=("fee_total", "sum"),
+                                        결제완료=("done", "sum"),
+                                        결제일=("paid_date", lambda x: ", ".join(sorted(set(x.dropna())))))
+    g["상태"] = ["✅ 결제완료" if r.결제완료 == r.전표수 else ("미결제" if r.결제완료 == 0 else "일부 결제")
+                for r in g.itertuples()]
+    g = g.reset_index().rename(columns={"partner_name": "거래처"})
+    table = pd.DataFrame({"선택": False, "거래처": g["거래처"], "전표 수": g["전표수"],
+                          "운반비": g["운반비"].map(won), "상태": g["상태"], "결제일": g["결제일"]})
+    edited = st.data_editor(table, hide_index=True, use_container_width=True, key=f"pay_tbl_{ym}",
+                            disabled=[c for c in table.columns if c != "선택"],
+                            column_config={"선택": st.column_config.CheckboxColumn("선택", width="small")})
+    chosen = edited.loc[edited["선택"], "거래처"].tolist()
+
+    b1, b2 = st.columns(2)
+    if b1.button(f"✅ 선택 거래처 일괄 결제 처리 ({pay_date})", type="primary",
+                 disabled=not chosen, use_container_width=True):
+        usc, usp = scope("invoices")
+        with engine().begin() as conn:
+            for pn in chosen:
+                conn.execute(text(f"""UPDATE invoices SET paid = fee_total, paid_date = :d
+                                      WHERE substr(invoice_date, 1, 7) = :ym AND partner_name = :pn
+                                        AND paid_date IS NULL AND {usc}"""),
+                             {"d": pay_date.isoformat(), "ym": ym, "pn": pn, **usp})
+        st.session_state.flash = f"{ym} 전표 결제 처리 완료 ({', '.join(chosen)}, 결제일 {pay_date})"
+        st.rerun()
+    with b2.popover("↩️ 선택 거래처 결제 취소", use_container_width=True, disabled=not chosen):
+        st.write(f"{ym} {', '.join(chosen)} 전표의 결제 처리를 취소합니다.")
+        if st.button("결제 취소 확인", key="pay_cancel"):
+            usc, usp = scope("invoices")
+            with engine().begin() as conn:
+                for pn in chosen:
+                    conn.execute(text(f"""UPDATE invoices SET paid = 0, paid_date = NULL
+                                          WHERE substr(invoice_date, 1, 7) = :ym AND partner_name = :pn AND {usc}"""),
+                                 {"ym": ym, "pn": pn, **usp})
+            st.session_state.flash = f"{ym} {', '.join(chosen)} 결제 처리를 취소했습니다."
+            st.rerun()
+
+    with st.expander(f"{ym} 전표 목록 보기"):
+        detail = pd.DataFrame({"날짜": inv["invoice_date"], "전표번호": inv["slip_no"], "거래처": inv["partner_name"],
+                               "운반비": inv["fee_total"].map(won),
+                               "결제": inv["paid_date"].fillna("").map(lambda d: f"✅ {d}" if d else "미결제")})
+        if is_admin():
+            detail["작성자"] = inv["created_by"]
+        st.dataframe(detail, hide_index=True, use_container_width=True)
 
 
 # ───────────────────────── 단가 변경 (유가 연동) ─────────────────────────
@@ -877,7 +1166,7 @@ def reapply_section():
                          [{"p": c["new"], "f": c["fee"], "i": int(c["id"])} for c in changes])
             for sn, fee_total in per_inv.reindex(summary["일련번호"]).items():
                 vat = round(fee_total * VAT_RATE)
-                conn.execute(text("UPDATE invoices SET fee_total = :f, vat = :v, total = :t WHERE serial_no = :s"),
+                conn.execute(text("UPDATE invoices SET fee_total = :f, vat = :v, total = :t, paid = CASE WHEN paid_date IS NOT NULL THEN :f ELSE paid END WHERE serial_no = :s"),
                              {"f": float(fee_total), "v": float(vat), "t": float(fee_total + vat), "s": sn})
         st.session_state.flash = f"전표 {len(summary)}건의 단가를 다시 적용했습니다."
         st.rerun()
@@ -926,8 +1215,10 @@ def page_price_table():
     st.download_button("📥 엑셀로 내려받기", buf.getvalue(), file_name="단가표.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+    if not is_admin():
+        return
     st.divider()
-    with st.expander("🗑️ 적용일자별 단가 삭제"):
+    with st.expander("🗑️ 적용일자별 단가 삭제 (관리자)"):
         st.caption("잘못 들어간 적용일자의 단가를 한꺼번에 지웁니다. 이미 입력한 전표의 단가는 바뀌지 않습니다.")
         d = st.selectbox("삭제할 적용일자", dates, index=None, placeholder="적용일자 선택")
         if d:
@@ -942,10 +1233,13 @@ def page_price_table():
 
 
 # ───────────────────────── main ─────────────────────────
-if check_password():
-    page = st.sidebar.radio("메뉴", ["전표 입력", "전표 조회", "단가표 조회", "단가 변경", "단가·거래처 관리"])
+if login():
+    sidebar_account()
+    pages = {"전표 입력": page_entry, "전표 조회": page_list, "결제 관리": page_payments,
+             "단가표 조회": page_price_table}
+    if is_admin():
+        pages.update({"단가 변경": page_price_change, "단가·거래처 관리": page_admin, "사용자 관리": page_users})
+    page = st.sidebar.radio("메뉴", list(pages))
     if st.sidebar.button("🔄 기준정보 새로고침"):
         clear_caches()
-    {"전표 입력": page_entry, "전표 조회": page_list, "단가표 조회": page_price_table,
-     "단가 변경": page_price_change,
-     "단가·거래처 관리": page_admin}[page]()
+    pages[page]()
