@@ -61,6 +61,7 @@ VAT_RATE = 0.1
 EMPTY_ROWS = 5
 DEFAULT_ORIGIN = "강원공장"
 CONTAINER_PREFIX = "201"
+KEG_5PCT_FROM = date(2026, 1, 1)  # 이 날짜 이후 송장은 생맥주 5% 추가분만 보여 줌
 MAX_MATCHES = 30
 
 
@@ -118,6 +119,13 @@ def lookup_price(prices, name, dest, d: date):
     if m.empty:
         return None
     return float(m.sort_values("apply_date").iloc[-1]["price"])
+
+
+def origin_notice(origin, product_type):
+    """출발지가 강원공장이 아닌데 제품구분이 용기·환입이 아니면 안내."""
+    if origin and origin != DEFAULT_ORIGIN and product_type not in SWAP_TYPES:
+        st.warning(f"출발지가 {DEFAULT_ORIGIN}이(가) 아닙니다. 용기·환입 입력은 출발지를 바꾸지 말고 "
+                   "**제품구분에서 용기 또는 환입을 선택**하세요. (출발지·도착지가 자동으로 바뀝니다)")
 
 
 def numeric_keypad():
@@ -204,16 +212,33 @@ def search_products(labels, kw):
     return [l for l in labels if all(ok(l, w) for w in words)]
 
 
+FULL_TABLE_MIN = 100  # 이보다 줄 수가 적은 적용일자는 일부 제품만 바뀐 '부분 단가표'로 봄
+
+
+def recent_table(prices, upto_iso, inclusive=True):
+    """가장 최근 '전체 단가표' 적용일부터 그 뒤 부분 단가표까지의 단가 (제품·도착지별 최신 1줄)."""
+    valid = prices[prices.apply_date <= upto_iso] if inclusive else prices[prices.apply_date < upto_iso]
+    if valid.empty:
+        return valid
+    counts = valid.groupby("apply_date").size()
+    full = counts[counts >= FULL_TABLE_MIN]
+    base = full.index.max() if len(full) else counts.index.max()
+    rows = valid[valid.apply_date >= base].sort_values("apply_date")
+    return rows.drop_duplicates(["product_name", "dest"], keep="last")
+
+
 def current_product_labels(prices, d: date):
     """작성일자 기준 가장 최근 적용일자의 단가표에 있는 제품 (단종·이름 바뀐 옛 제품 제외).
     용기(201…)는 최근 단가표에 빠져 있어도 1년 안에 단가가 있었으면 함께 보여 줌 (예: 2011002 생맥주통)."""
     valid = prices[prices.apply_date <= d.isoformat()]
     if valid.empty:
         return []
-    cur = valid[valid.apply_date == valid.apply_date.max()]
+    cur = recent_table(prices, d.isoformat())
     year_ago = (d - timedelta(days=365)).isoformat()
     cont = valid[(valid.apply_date >= year_ago) & valid.product_code.fillna("").str.startswith(CONTAINER_PREFIX)]
     both = pd.concat([cur, cont]).dropna(subset=["product_code"]).drop_duplicates(["product_code", "product_name"])
+    if d >= KEG_5PCT_FROM:  # 2026-01-01 이후 생맥주는 5% 추가분 제품만
+        both = both[~(both.product_name.str.contains("유흥생") & ~both.product_name.str.contains("추가"))]
     return [f"{c} - {n}" for c, n in sorted(zip(both.product_code, both.product_name))]
 
 
@@ -691,6 +716,7 @@ def page_entry():
     price_dest = origin if swapped else dest  # 단가는 원래(바뀌기 전) 도착지 기준
     if swapped and origin and dest:
         st.caption(f"{product_type}: 출발지와 도착지를 바꿨습니다. 단가는 {price_dest} 기준으로 적용합니다.")
+    origin_notice(origin, product_type)
 
     # 제품 입력
     st.subheader("제품")
@@ -851,6 +877,7 @@ def edit_invoice(serial, inv):
     new_ptype = _pick("제품구분", PRODUCT_TYPES, inv.product_type, k + "ptype")
     new_unload = _pick("하차구분", UNLOAD_TYPES, inv.unload_type, k + "unload")
     new_empty = _pick("공차구분", EMPTY_TYPES, inv.empty_type, k + "empty")
+    origin_notice(new_origin, new_ptype)
 
     old = q("""SELECT product_code, product_name, qty, unit_price
                FROM invoice_items WHERE serial_no = :s ORDER BY id""", s=serial)
@@ -1391,8 +1418,7 @@ def price_change_judgement(fuel_map):
     st.subheader("③ 새 단가 미리보기")
     st.caption("새 단가는 소수 둘째 자리까지 계산합니다 (셋째 자리에서 반올림).")
     # 직전 적용일자의 단가표(현재 단가)만 대상 — 옛날에 끝난 제품·이름이 바뀐 제품은 제외
-    before = prices[prices["apply_date"] < apply_date.isoformat()]
-    latest = before[before["apply_date"] == before["apply_date"].max()].drop_duplicates(["product_name", "dest"])
+    latest = recent_table(prices, apply_date.isoformat(), inclusive=False).copy()
     latest["새단가"] = [round_price(p * (1 + rate)) for p in latest["price"]]
     latest["차이"] = latest["새단가"] - latest["price"]
     view = latest.rename(columns={"product_code": "제품코드", "product_name": "제품명", "dest": "도착지",
