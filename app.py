@@ -737,7 +737,14 @@ def page_entry():
     c1, c2, c3, c4, c5, c6 = st.columns([1.3, 1.3, 1, 1, 1, 1])
     origin = c1.selectbox("출발지", places, index=origin_idx, placeholder="선택", key="origin")
     dest = c2.selectbox("도착지", places, index=None, placeholder="선택 또는 입력", key="dest")
-    c3.text_input("도착지 코드", key="dest_code", on_change=on_dest_code, placeholder="코드 입력 후 Enter")
+    def clear_dest():
+        ss.dest = None
+        ss.dest_code = ""
+    # 도착지가 정해지면 코드 칸은 잠금 (다시 코드로 넣으려면 아래 버튼)
+    c3.text_input("도착지 코드", key="dest_code", on_change=on_dest_code, disabled=bool(dest),
+                  placeholder="도착지 선택됨" if dest else "코드 입력 후 Enter")
+    if dest:
+        c3.button("↺ 코드로 다시 입력", key="dest_reset", on_click=clear_dest)
     product_type = c4.selectbox("제품구분", PRODUCT_TYPES, key="ptype", on_change=on_type_change)
     unload_type = c5.selectbox("하차구분", UNLOAD_TYPES)
     empty_type = c6.selectbox("공차구분", EMPTY_TYPES)
