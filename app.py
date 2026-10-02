@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from sqlalchemy import inspect as sa_inspect, text
 from sqlalchemy.exc import IntegrityError
 
@@ -117,6 +118,30 @@ def lookup_price(prices, name, dest, d: date):
     if m.empty:
         return None
     return float(m.sort_values("apply_date").iloc[-1]["price"])
+
+
+def numeric_keypad():
+    """전표번호·도착지 코드 칸을 누르면 휴대폰에서 숫자 키패드가 뜨도록 (PC에서는 영향 없음)."""
+    components.html("""<script>
+    (function(){
+      const doc = window.parent.document;
+      const SEL = 'input[aria-label^="전표번호"], input[aria-label^="도착지 코드"]';
+      function apply(){
+        doc.querySelectorAll(SEL).forEach(function(el){
+          if (el.getAttribute('inputmode') !== 'numeric') {
+            el.setAttribute('inputmode', 'numeric');
+            el.setAttribute('pattern', '[0-9]*');
+            el.setAttribute('autocomplete', 'off');
+          }
+        });
+      }
+      apply();
+      if (!window.parent.__gtaxNumObs) {
+        window.parent.__gtaxNumObs = new MutationObserver(apply);
+        window.parent.__gtaxNumObs.observe(doc.body, {childList: true, subtree: true});
+      }
+    })();
+    </script>""", height=0)
 
 
 def is_mobile():
@@ -614,6 +639,9 @@ def page_entry():
     if not slip_suffix.strip():
         st.warning("전표번호를 먼저 입력하세요. 전표번호를 입력해야 다음 항목이 나타납니다.")
         return
+    if not slip_suffix.strip().isdigit():
+        st.warning("전표번호는 숫자만 입력하세요.")
+        return
 
     # 출발지 / 도착지 / 도착지 코드 (기존 프로그램과 같은 방식)
     # 용기·환입을 고르면 출발지↔도착지가 화면에서 바뀌고, 단가는 바뀌기 전 도착지 기준으로 찾는다.
@@ -811,7 +839,10 @@ def edit_invoice(serial, inv):
     c1, c2, c3 = st.columns(3)
     new_date = c1.date_input("작성일자", value=date.fromisoformat(inv.invoice_date),
                              format="YYYY-MM-DD", key=k + "date")
-    new_slip = c2.text_input("전표번호", value=inv.slip_no or "", key=k + "slip")
+    old_suffix = (_s(inv.slip_no).split("_", 1) + [""])[1] if "_" in _s(inv.slip_no) else _s(inv.slip_no)
+    new_suffix = c2.text_input(f"전표번호  ({new_date:%Y%m}_ 뒤 6자리)", value=old_suffix[:6], max_chars=6,
+                               key=k + "slip")
+    new_slip = f"{new_date:%Y%m}_{new_suffix.strip()}"
     new_partner = _pick("거래처", partners["name"].tolist(), inv.partner_name, k + "partner")
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -1508,6 +1539,7 @@ def page_price_table():
 if login() and me().get("must_change"):
     force_change_password()
 elif me():
+    numeric_keypad()
     pages = {"전표 입력": page_entry, "전표 조회": page_list, "결제 관리": page_payments,
              "단가표 조회": page_price_table}
     if is_admin():
