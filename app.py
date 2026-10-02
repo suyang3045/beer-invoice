@@ -121,11 +121,14 @@ def lookup_price(prices, name, dest, d: date):
     return float(m.sort_values("apply_date").iloc[-1]["price"])
 
 
-def origin_notice(origin, product_type):
-    """출발지가 강원공장이 아닌데 제품구분이 용기·환입이 아니면 안내."""
+def origin_blocked(origin, product_type):
+    """출발지가 강원공장이 아닌데 제품구분이 용기·환입이 아니면 아래 입력을 닫고 안내 (True = 막힘)."""
     if origin and origin != DEFAULT_ORIGIN and product_type not in SWAP_TYPES:
-        st.warning(f"출발지가 {DEFAULT_ORIGIN}이(가) 아닙니다. 용기·환입 입력은 출발지를 바꾸지 말고 "
-                   "**제품구분에서 용기 또는 환입을 선택**하세요. (출발지·도착지가 자동으로 바뀝니다)")
+        st.error(f"🚫 출발지는 **{DEFAULT_ORIGIN}**으로 두세요. 용기·환입은 출발지를 바꾸지 말고 "
+                 "**제품구분에서 용기 또는 환입을 선택**하면 출발지·도착지가 자동으로 바뀝니다. "
+                 "출발지를 고치면 아래 입력칸이 다시 열립니다.")
+        return True
+    return False
 
 
 def numeric_keypad():
@@ -336,6 +339,30 @@ PW_HELP = "비밀번호는 숫자 6자리로 만드세요."
 KEEP_DAYS = 90
 
 
+COOKIE_TOKEN = "beer_t"   # 자동 로그인 열쇠 (기기 브라우저에 저장, 재부팅해도 유지)
+COOKIE_UID = "beer_uid"   # 아이디 저장
+
+
+def browser_cookie(name):
+    try:
+        return (st.context.cookies or {}).get(name)
+    except Exception:
+        return None
+
+
+def write_cookies(values, days=KEEP_DAYS):
+    """브라우저(이 기기)에 쿠키 저장. 값이 None이면 삭제."""
+    js = []
+    for name, val in values.items():
+        age = 0 if val is None else days * 86400
+        js.append(f"document.cookie = {name!r} + '=' + {str(val or '')!r} + '; max-age={age}; path=/; SameSite=Lax' + sec;")
+    components.html("""<script>(function(){ try {
+      var document = window.parent.document;
+      var sec = window.parent.location.protocol === 'https:' ? '; Secure' : '';
+      """ + "\n".join(js) + """
+    } catch(e) {} })();</script>""", height=0)
+
+
 def issue_token(user_id):
     tok = pysecrets.token_urlsafe(24)
     with engine().begin() as conn:
@@ -343,13 +370,18 @@ def issue_token(user_id):
                      {"t": tok, "u": user_id, "e": (today_kst() + timedelta(days=KEEP_DAYS)).isoformat()})
     st.query_params["t"] = tok
     st.session_state.token = tok
+    st.session_state.cookie_out = {COOKIE_TOKEN: tok}
 
 
 def login():
     ensure_auth_schema()
+    if out := st.session_state.pop("cookie_out", None):
+        write_cookies(out)
     if me():
         return True
     tok = st.query_params.get("t")
+    if not tok and not st.session_state.get("no_cookie_login"):
+        tok = browser_cookie(COOKIE_TOKEN)  # 재부팅·새 창이어도 이 기기에 저장된 열쇠로 자동 로그인
     if tok:
         row = q("""SELECT u.user_id, u.name, u.is_admin, u.must_change FROM login_tokens t
                    JOIN users u ON u.user_id = t.user_id
@@ -359,8 +391,13 @@ def login():
             st.session_state.user = {"user_id": row.user_id[0], "name": row.name[0],
                                      "is_admin": bool(row.is_admin[0]), "must_change": bool(row.must_change[0] or 0)}
             st.session_state.token = tok
+            if st.query_params.get("t") != tok:
+                st.query_params["t"] = tok
             return True
-        del st.query_params["t"]
+        if "t" in st.query_params:
+            del st.query_params["t"]
+        write_cookies({COOKIE_TOKEN: None})  # 만료되었거나 무효인 열쇠는 지움
+        st.session_state.no_cookie_login = True
     st.title("🍺 맥주 운송전표")
     n_users = int(q("SELECT COUNT(*) AS n FROM users").n[0])
 
@@ -396,9 +433,11 @@ def login():
         return False
 
     with st.form("login"):
-        uid = st.text_input("아이디")
+        saved_uid = browser_cookie(COOKIE_UID) or ""
+        uid = st.text_input("아이디", value=saved_uid)
         pw = st.text_input("비밀번호 (숫자 6자리)", type="password", max_chars=6)
-        keep = st.checkbox("이 기기에서 로그인 상태 유지 (자동 로그인)", value=True)
+        save_id = st.checkbox("아이디 저장", value=True)
+        keep = st.checkbox("이 기기에서 로그인 상태 유지 (휴대폰을 껐다 켜도 유지)", value=True)
         if st.form_submit_button("로그인", type="primary"):
             row = q("SELECT user_id, name, pw_hash, is_admin, must_change FROM users WHERE user_id = :u AND active = 1",
                     u=uid.strip())
@@ -408,6 +447,9 @@ def login():
                                          "must_change": bool(row.must_change[0] or 0)}
                 if keep:
                     issue_token(row.user_id[0])
+                out = st.session_state.get("cookie_out", {})
+                out[COOKIE_UID] = row.user_id[0] if save_id else None
+                st.session_state.cookie_out = out
                 st.rerun()
             st.error("아이디 또는 비밀번호가 맞지 않습니다.")
     return False
@@ -443,6 +485,8 @@ def logout():
             conn.execute(text("DELETE FROM login_tokens WHERE token = :t"), {"t": tok})
     st.query_params.clear()
     st.session_state.clear()
+    st.session_state.no_cookie_login = True          # 이번 창에서는 쿠키로 다시 들어가지 않음
+    st.session_state.cookie_out = {COOKIE_TOKEN: None}  # 이 기기의 자동 로그인 해제 (아이디 저장은 유지)
     st.rerun()
 
 
@@ -716,7 +760,8 @@ def page_entry():
     price_dest = origin if swapped else dest  # 단가는 원래(바뀌기 전) 도착지 기준
     if swapped and origin and dest:
         st.caption(f"{product_type}: 출발지와 도착지를 바꿨습니다. 단가는 {price_dest} 기준으로 적용합니다.")
-    origin_notice(origin, product_type)
+    if origin_blocked(origin, product_type):
+        return
 
     # 제품 입력
     st.subheader("제품")
@@ -877,7 +922,8 @@ def edit_invoice(serial, inv):
     new_ptype = _pick("제품구분", PRODUCT_TYPES, inv.product_type, k + "ptype")
     new_unload = _pick("하차구분", UNLOAD_TYPES, inv.unload_type, k + "unload")
     new_empty = _pick("공차구분", EMPTY_TYPES, inv.empty_type, k + "empty")
-    origin_notice(new_origin, new_ptype)
+    if origin_blocked(new_origin, new_ptype):
+        return
 
     old = q("""SELECT product_code, product_name, qty, unit_price
                FROM invoice_items WHERE serial_no = :s ORDER BY id""", s=serial)
