@@ -97,7 +97,10 @@ def load_products():
 
 @st.cache_data(ttl=600)
 def load_prices():
-    return q("SELECT apply_date, product_code, product_name, dest, price FROM unit_prices")
+    df = q("SELECT apply_date, product_code, product_name, dest, price FROM unit_prices")
+    # 2026년 1월 단가표의 '(생맥추가)'는 4월부터의 '(생5.0%추가)'와 같은 5% 추가 제품 → 이름 통일
+    df["product_name"] = df["product_name"].str.replace("(생맥추가)", "(생5.0%추가)", regex=False)
+    return df
 
 
 @st.cache_data(ttl=60)
