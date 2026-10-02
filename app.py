@@ -236,6 +236,10 @@ def ensure_auth_schema():
                                  is_admin INTEGER DEFAULT 0, active INTEGER DEFAULT 1, created_at TEXT)"""))
         conn.execute(text("""CREATE TABLE IF NOT EXISTS login_tokens (
                                  token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires TEXT NOT NULL)"""))
+    ucols = {c["name"] for c in sa_inspect(eng).get_columns("users")}
+    if "must_change" not in ucols:  # 1이면 다음 로그인 때 비밀번호를 새로 정해야 함
+        with eng.begin() as conn:
+            conn.execute(text("ALTER TABLE users ADD COLUMN must_change INTEGER DEFAULT 0"))
     cols = {c["name"] for c in sa_inspect(eng).get_columns("invoices")}
     for col in ("created_by", "paid_date"):
         if col not in cols:
@@ -297,13 +301,13 @@ def login():
         return True
     tok = st.query_params.get("t")
     if tok:
-        row = q("""SELECT u.user_id, u.name, u.is_admin FROM login_tokens t
+        row = q("""SELECT u.user_id, u.name, u.is_admin, u.must_change FROM login_tokens t
                    JOIN users u ON u.user_id = t.user_id
                    WHERE t.token = :t AND t.expires >= :today AND u.active = 1""",
                 t=tok, today=today_kst().isoformat())
         if not row.empty:
             st.session_state.user = {"user_id": row.user_id[0], "name": row.name[0],
-                                     "is_admin": bool(row.is_admin[0])}
+                                     "is_admin": bool(row.is_admin[0]), "must_change": bool(row.must_change[0] or 0)}
             st.session_state.token = tok
             return True
         del st.query_params["t"]
@@ -346,16 +350,40 @@ def login():
         pw = st.text_input("비밀번호 (숫자 6자리)", type="password", max_chars=6)
         keep = st.checkbox("이 기기에서 로그인 상태 유지 (자동 로그인)", value=True)
         if st.form_submit_button("로그인", type="primary"):
-            row = q("SELECT user_id, name, pw_hash, is_admin FROM users WHERE user_id = :u AND active = 1",
+            row = q("SELECT user_id, name, pw_hash, is_admin, must_change FROM users WHERE user_id = :u AND active = 1",
                     u=uid.strip())
             if not row.empty and check_pw(pw, row.pw_hash[0]):
                 st.session_state.user = {"user_id": row.user_id[0], "name": row.name[0],
-                                         "is_admin": bool(row.is_admin[0])}
+                                         "is_admin": bool(row.is_admin[0]),
+                                         "must_change": bool(row.must_change[0] or 0)}
                 if keep:
                     issue_token(row.user_id[0])
                 st.rerun()
             st.error("아이디 또는 비밀번호가 맞지 않습니다.")
     return False
+
+
+def force_change_password():
+    """관리자가 초기화한 비밀번호로 로그인하면, 본인이 새 비밀번호를 정해야 사용 가능."""
+    u = me()
+    st.title("🔑 새 비밀번호 정하기")
+    st.info(f"{u['name']}님, 관리자가 비밀번호를 초기화했습니다. 앞으로 쓸 비밀번호를 새로 정하세요.")
+    with st.form("force_pw"):
+        new1 = st.text_input("새 비밀번호 (숫자 6자리)", type="password", max_chars=6)
+        new2 = st.text_input("새 비밀번호 확인", type="password", max_chars=6)
+        if st.form_submit_button("저장하고 시작하기", type="primary"):
+            if not PW_RE.match(new1):
+                st.error(PW_HELP)
+            elif new1 != new2:
+                st.error("새 비밀번호 확인이 다릅니다.")
+            else:
+                with engine().begin() as conn:
+                    conn.execute(text("UPDATE users SET pw_hash = :h, must_change = 0 WHERE user_id = :u"),
+                                 {"h": hash_pw(new1), "u": u["user_id"]})
+                st.session_state.user["must_change"] = False
+                st.rerun()
+    if st.button("로그아웃"):
+        logout()
 
 
 def logout():
@@ -431,7 +459,7 @@ def account_menu():
                     st.error("새 비밀번호 확인이 다릅니다.")
                 else:
                     with engine().begin() as conn:
-                        conn.execute(text("UPDATE users SET pw_hash = :h WHERE user_id = :u"),
+                        conn.execute(text("UPDATE users SET pw_hash = :h, must_change = 0 WHERE user_id = :u"),
                                      {"h": hash_pw(new1), "u": u["user_id"]})
                         # 비밀번호를 바꾸면 다른 기기의 자동 로그인은 해제
                         conn.execute(text("DELETE FROM login_tokens WHERE user_id = :u AND token <> :t"),
@@ -485,18 +513,32 @@ def page_users():
         row = users[users["아이디"] == target].iloc[0]
         admins = int(users[users["관리자"] & users["사용"]].shape[0])
         c1, c2 = st.columns(2)
-        with c1.form("reset_pw", clear_on_submit=True):
-            npw = st.text_input("새 비밀번호 (숫자 6자리)", type="password", max_chars=6)
-            if st.form_submit_button("비밀번호 초기화"):
-                if not PW_RE.match(npw):
-                    st.error(PW_HELP)
-                else:
-                    with engine().begin() as conn:
-                        conn.execute(text("UPDATE users SET pw_hash = :h WHERE user_id = :u"),
-                                     {"h": hash_pw(npw), "u": target})
-                        conn.execute(text("DELETE FROM login_tokens WHERE user_id = :u"), {"u": target})
-                    st.session_state.flash = f"{target} 비밀번호를 바꿨습니다."
-                    st.rerun()
+        with c1:
+            st.markdown("**비밀번호 초기화**")
+            st.caption("비밀번호는 암호화되어 저장되므로 관리자도 볼 수 없습니다. 잊었으면 초기화해 주세요. "
+                       "초기화하면 그 사용자는 다음 로그인 때 자기 비밀번호를 새로 정합니다.")
+            if st.button("🎲 임시 비밀번호 만들기", key=f"temp_{target}", use_container_width=True):
+                temp = f"{pysecrets.randbelow(1_000_000):06d}"
+                with engine().begin() as conn:
+                    conn.execute(text("UPDATE users SET pw_hash = :h, must_change = 1 WHERE user_id = :u"),
+                                 {"h": hash_pw(temp), "u": target})
+                    conn.execute(text("DELETE FROM login_tokens WHERE user_id = :u"), {"u": target})
+                st.session_state.flash = (f"{target} 임시 비밀번호: {temp}  — 이 번호를 직원에게 알려 주세요. "
+                                          "로그인하면 바로 새 비밀번호를 정하게 됩니다.")
+                st.rerun()
+            with st.form(f"reset_pw_{target}", clear_on_submit=True):
+                npw = st.text_input("직접 정하기 (숫자 6자리)", type="password", max_chars=6)
+                force = st.checkbox("다음 로그인 때 본인이 다시 정하게 하기", value=True)
+                if st.form_submit_button("이 번호로 초기화"):
+                    if not PW_RE.match(npw):
+                        st.error(PW_HELP)
+                    else:
+                        with engine().begin() as conn:
+                            conn.execute(text("UPDATE users SET pw_hash = :h, must_change = :m WHERE user_id = :u"),
+                                         {"h": hash_pw(npw), "m": int(force), "u": target})
+                            conn.execute(text("DELETE FROM login_tokens WHERE user_id = :u"), {"u": target})
+                        st.session_state.flash = f"{target} 비밀번호를 초기화했습니다."
+                        st.rerun()
         with c2:
             new_admin = st.checkbox("관리자", value=bool(row["관리자"]), key=f"adm_{target}")
             new_active = st.checkbox("사용 (끄면 로그인 불가, 기록은 보존)", value=bool(row["사용"]), key=f"act_{target}")
@@ -513,6 +555,32 @@ def page_users():
                         if not new_active:
                             conn.execute(text("DELETE FROM login_tokens WHERE user_id = :u"), {"u": target})
                     st.session_state.flash = f"{target} 설정을 저장했습니다."
+                    st.rerun()
+
+        st.markdown("**사용자 삭제**")
+        n_inv = int(row["전표 수"])
+        others = [u for u in users["아이디"].tolist() if u != target]
+        if target == me()["user_id"]:
+            st.caption("자기 자신은 삭제할 수 없습니다.")
+        elif bool(row["관리자"]) and bool(row["사용"]) and admins <= 1:
+            st.caption("마지막 관리자는 삭제할 수 없습니다.")
+        else:
+            with st.popover(f"🗑️ {target} 삭제", use_container_width=True):
+                heir = None
+                if n_inv:
+                    heir = st.selectbox(f"{target}이(가) 입력한 전표 {n_inv}건을 넘겨받을 사용자", others,
+                                        index=others.index(me()["user_id"]) if me()["user_id"] in others else 0,
+                                        key=f"heir_{target}")
+                    st.caption("전표는 지워지지 않고 이 사용자의 것으로 바뀝니다.")
+                if st.button("삭제 확인", type="primary", key=f"del_{target}"):
+                    with engine().begin() as conn:
+                        if heir:
+                            conn.execute(text("UPDATE invoices SET created_by = :h WHERE created_by = :u"),
+                                         {"h": heir, "u": target})
+                        conn.execute(text("DELETE FROM login_tokens WHERE user_id = :u"), {"u": target})
+                        conn.execute(text("DELETE FROM users WHERE user_id = :u"), {"u": target})
+                    st.session_state.flash = (f"{target} 사용자를 삭제했습니다."
+                                              + (f" 전표 {n_inv}건은 {heir}에게 넘겼습니다." if heir else ""))
                     st.rerun()
 
 
@@ -1437,7 +1505,9 @@ def page_price_table():
 
 
 # ───────────────────────── main ─────────────────────────
-if login():
+if login() and me().get("must_change"):
+    force_change_password()
+elif me():
     pages = {"전표 입력": page_entry, "전표 조회": page_list, "결제 관리": page_payments,
              "단가표 조회": page_price_table}
     if is_admin():
