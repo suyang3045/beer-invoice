@@ -724,8 +724,12 @@ def page_entry():
         if hit.empty:
             ss.code_msg = f"도착지 코드 {code} 를 찾을 수 없습니다."
             return
-        o, d = hit.iloc[0]["origin"], hit.iloc[0]["dest"]
-        ss.origin, ss.dest = (d, o) if ss.get("swapped") else (o, d)
+        place = hit.iloc[0]["dest"]
+        # 코드는 도착지만 채움 (출발지는 그대로). 용기·환입으로 바뀐 상태면 강원공장 반대편(출발지 칸)에 채움
+        if ss.get("swapped"):
+            ss.origin = place
+        else:
+            ss.dest = place
 
     def on_type_change():
         want = ss.get("ptype") in SWAP_TYPES
