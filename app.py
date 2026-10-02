@@ -119,66 +119,50 @@ def lookup_price(prices, name, dest, d: date):
     return float(m.sort_values("apply_date").iloc[-1]["price"])
 
 
+# 묶음 검색어: 한 단어로 그 종류 전체를 보여 줌 (제품명 기준, 공백 무시)
+CATEGORY_RULES = {
+    "생": r"유흥생", "생맥": r"유흥생", "생맥주": r"유흥생", "케그": r"유흥생",   # 생맥주 20L 전체
+    "유중": r"유흥500", "중병": r"유흥500",                                    # 유흥 중병(500ml) 전체
+    "유소": r"유흥330", "소병": r"유흥330",                                    # 유흥 소병(330ml) 전체
+    "캔": r"캔.*지355", "소캔": r"캔.*지355",                                  # 355캔 전체
+    "중캔": r"캔.*지(4\d\d|500)",                                             # 400~500캔 전체
+    "피쳐": r"피쳐", "페트": r"피쳐", "피처": r"피쳐",                          # 피쳐(페트) 전체
+    "공병": r"공병", "빈병": r"공병",                                          # 공병(병류) 전체
+    "공통": r"생맥주통.*\(신\)", "빈통": r"생맥주통.*\(신\)",                # 공통 = 생맥주 빈 통 (2011002)
+}
 # 검색어 별칭: 현장에서 부르는 말 → 제품명에 실제로 들어 있는 글자
 SEARCH_ALIASES = {
-    "생맥주": ["유흥생"], "생맥": ["유흥생"], "생": ["유흥생"], "케그": ["유흥생"],
     "캘리": ["캘리", "켈리"], "켈리": ["캘리", "켈리"],
     "하이트": ["하이트", "hite"], "맥스": ["맥스", "맥)"],
     "필라이트": ["필)", "필후)", "필클리어"],
-    "페트": ["피쳐"], "피처": ["피쳐"],
     "파렛트": ["파렛", "pallet"], "팔레트": ["파렛", "pallet"], "파레트": ["파렛", "pallet"],
     "박스": ["box"], "가스": ["co2"], "탄산": ["co2"],
 }
 
 
-def is_mobile():
-    """휴대폰 화면 여부 (계정 메뉴에서 직접 바꿀 수도 있음)."""
-    mode = st.session_state.get("view_mode", "자동")
-    if mode != "자동":
-        return mode == "휴대폰"
-    try:
-        ua = st.context.headers.get("User-Agent", "") or ""
-    except Exception:
-        ua = ""
-    return any(k in ua for k in ("Mobi", "Android", "iPhone"))
-
-
-@st.cache_data(ttl=60)
-def favorites(user_id, d: date):
-    """내가 최근 60일 동안 자주 쓴 행선지·제품 (휴대폰에서 한 번에 누르기용)."""
-    since = (d - timedelta(days=60)).isoformat()
-    routes = q("""SELECT origin, dest, product_type, COUNT(*) AS n FROM invoices
-                  WHERE created_by = :u AND invoice_date >= :s
-                  GROUP BY origin, dest, product_type ORDER BY n DESC LIMIT 8""", u=user_id, s=since)
-    rlist = []
-    for r in routes.itertuples():
-        o, de = (r.dest, r.origin) if r.product_type in SWAP_TYPES else (r.origin, r.dest)
-        if o and de and (o, de) not in rlist:
-            rlist.append((o, de))
-    prods = q("""SELECT i.product_code, i.product_name, COUNT(*) AS n
-                 FROM invoice_items i JOIN invoices v ON v.serial_no = i.serial_no
-                 WHERE v.created_by = :u AND v.invoice_date >= :s
-                 GROUP BY i.product_code, i.product_name ORDER BY n DESC LIMIT 30""", u=user_id, s=since)
-    plist = [f"{r.product_code} - {r.product_name}" for r in prods.itertuples()]
-    return rlist[:6], plist
-
-
 def search_products(labels, kw):
-    """띄어 쓴 단어가 모두 들어 있는 제품 (대소문자·공백 무시, 코드·별칭으로도 검색)."""
+    """띄어 쓴 단어가 모두 맞는 제품. 묶음 검색어(생·유중·캔·중캔…)는 그 종류 전체."""
     words = [w for w in kw.lower().split() if w]
-    alts = [[a.lower().replace(" ", "") for a in SEARCH_ALIASES.get(w, [])] + [w] for w in words]
-    return [l for l in labels
-            if all(any(a in l.lower().replace(" ", "") for a in alt) for alt in alts)]
+    def ok(label, w):
+        name = label.split(" - ", 1)[-1].lower().replace(" ", "")
+        if w in CATEGORY_RULES:
+            return re.search(CATEGORY_RULES[w], name) is not None
+        full = label.lower().replace(" ", "")
+        return any(a.lower() in full for a in SEARCH_ALIASES.get(w, []) + [w])
+    return [l for l in labels if all(ok(l, w) for w in words)]
 
 
 def current_product_labels(prices, d: date):
-    """작성일자 기준 가장 최근 적용일자의 단가표에 있는 제품만 (단종·이름 바뀐 옛 제품 제외)."""
+    """작성일자 기준 가장 최근 적용일자의 단가표에 있는 제품 (단종·이름 바뀐 옛 제품 제외).
+    용기(201…)는 최근 단가표에 빠져 있어도 1년 안에 단가가 있었으면 함께 보여 줌 (예: 2011002 생맥주통)."""
     valid = prices[prices.apply_date <= d.isoformat()]
     if valid.empty:
         return []
     cur = valid[valid.apply_date == valid.apply_date.max()]
-    cur = cur.dropna(subset=["product_code"]).drop_duplicates(["product_code", "product_name"])
-    return [f"{c} - {n}" for c, n in sorted(zip(cur.product_code, cur.product_name))]
+    year_ago = (d - timedelta(days=365)).isoformat()
+    cont = valid[(valid.apply_date >= year_ago) & valid.product_code.fillna("").str.startswith(CONTAINER_PREFIX)]
+    both = pd.concat([cur, cont]).dropna(subset=["product_code"]).drop_duplicates(["product_code", "product_name"])
+    return [f"{c} - {n}" for c, n in sorted(zip(both.product_code, both.product_name))]
 
 
 def previous_unpaid(partner_name, d: date):
@@ -568,7 +552,7 @@ def page_entry():
     if msg := ss.pop("code_msg", None):
         st.warning(msg)
 
-    fav_routes, fav_products = favorites(me().get("user_id"), inv_date)
+    fav_routes, _ = favorites(me().get("user_id"), inv_date)
     if fav_routes:
         def on_fav_route(key):
             val = ss.get(key)
@@ -596,13 +580,8 @@ def page_entry():
     addv = ss.setdefault("add_ver", 0)
 
     with st.container(border=True):
-        fav_labels = [l for l in fav_products if l in set(product_labels)][:8]
-        fav_pick = None
-        if fav_labels:
-            fav_pick = st.pills("자주 쓰는 제품", fav_labels, key=f"favp_{ver}_{addv}",
-                                format_func=lambda l: l.split(" - ", 1)[-1])
         kw = st.text_input("제품 검색", key=f"kw_{ver}_{addv}",
-                           placeholder="예: 생맥주, 유흥, 캔, 테라 500 (띄어 쓰면 모두 포함된 제품)")
+                           placeholder="생 · 유중(500병) · 유소(330병) · 캔(355) · 중캔(400~500) · 용기: 공병 · 공통")
         if kw.strip():
             matches = search_products(product_labels, kw)
         elif product_type == "용기":
@@ -616,7 +595,6 @@ def page_entry():
             if len(matches) > MAX_MATCHES:
                 st.caption(f"{len(matches)}개 중 {MAX_MATCHES}개만 보여 줍니다. 검색어를 더 입력하세요.")
             pick = st.radio("제품 선택", matches[:MAX_MATCHES], index=None, key=f"pick_{ver}_{addv}")
-        pick = pick or fav_pick
         if pick:
             st.info(f"선택: {pick}")
         c1, c2 = st.columns([2, 1])
