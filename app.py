@@ -119,6 +119,33 @@ def lookup_price(prices, name, dest, d: date):
     return float(m.sort_values("apply_date").iloc[-1]["price"])
 
 
+def is_mobile():
+    """휴대폰 화면 여부 (계정 메뉴에서 직접 바꿀 수도 있음)."""
+    mode = st.session_state.get("view_mode", "자동")
+    if mode != "자동":
+        return mode == "휴대폰"
+    try:
+        ua = st.context.headers.get("User-Agent", "") or ""
+    except Exception:
+        ua = ""
+    return any(k in ua for k in ("Mobi", "Android", "iPhone"))
+
+
+@st.cache_data(ttl=60)
+def favorites(user_id, d: date):
+    """내가 최근 60일 동안 자주 쓴 행선지·제품 (휴대폰에서 한 번에 누르기용)."""
+    since = (d - timedelta(days=60)).isoformat()
+    routes = q("""SELECT origin, dest, product_type, COUNT(*) AS n FROM invoices
+                  WHERE created_by = :u AND invoice_date >= :s
+                  GROUP BY origin, dest, product_type ORDER BY n DESC LIMIT 8""", u=user_id, s=since)
+    rlist = []
+    for r in routes.itertuples():
+        o, de = (r.dest, r.origin) if r.product_type in SWAP_TYPES else (r.origin, r.dest)
+        if o and de and (o, de) not in rlist:
+            rlist.append((o, de))
+    return rlist[:6], []
+
+
 # 묶음 검색어: 한 단어로 그 종류 전체를 보여 줌 (제품명 기준, 공백 무시)
 CATEGORY_RULES = {
     "생": r"유흥생", "생맥": r"유흥생", "생맥주": r"유흥생", "케그": r"유흥생",   # 생맥주 20L 전체
