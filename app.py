@@ -40,6 +40,15 @@ st.markdown("""
 [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],
 [data-testid="stExpandSidebarButton"], [data-testid="stHeader"], header {display: none !important;}
 .block-container, [data-testid="stMainBlockContainer"] {padding-top: 1rem !important;}
+/* 휴대폰: 글자·버튼을 손가락으로 누르기 쉽게, 입력칸 누를 때 화면 확대 방지 */
+@media (max-width: 760px) {
+  .block-container, [data-testid="stMainBlockContainer"] {padding-left: .7rem !important; padding-right: .7rem !important;}
+  input, textarea, select, [data-baseweb="select"] * {font-size: 16px !important;}
+  .stButton button, .stDownloadButton button, [data-testid="stPopover"] button {min-height: 46px; font-size: 16px;}
+  [data-testid="stRadio"] label {padding: 8px 4px; font-size: 16px;}
+  [data-testid="stPills"] button, [data-testid="stButtonGroup"] button {min-height: 40px; font-size: 15px;}
+  h1, h2 {font-size: 1.4rem !important;}
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -120,6 +129,38 @@ SEARCH_ALIASES = {
     "파렛트": ["파렛", "pallet"], "팔레트": ["파렛", "pallet"], "파레트": ["파렛", "pallet"],
     "박스": ["box"], "가스": ["co2"], "탄산": ["co2"],
 }
+
+
+def is_mobile():
+    """휴대폰 화면 여부 (계정 메뉴에서 직접 바꿀 수도 있음)."""
+    mode = st.session_state.get("view_mode", "자동")
+    if mode != "자동":
+        return mode == "휴대폰"
+    try:
+        ua = st.context.headers.get("User-Agent", "") or ""
+    except Exception:
+        ua = ""
+    return any(k in ua for k in ("Mobi", "Android", "iPhone"))
+
+
+@st.cache_data(ttl=60)
+def favorites(user_id, d: date):
+    """내가 최근 60일 동안 자주 쓴 행선지·제품 (휴대폰에서 한 번에 누르기용)."""
+    since = (d - timedelta(days=60)).isoformat()
+    routes = q("""SELECT origin, dest, product_type, COUNT(*) AS n FROM invoices
+                  WHERE created_by = :u AND invoice_date >= :s
+                  GROUP BY origin, dest, product_type ORDER BY n DESC LIMIT 8""", u=user_id, s=since)
+    rlist = []
+    for r in routes.itertuples():
+        o, de = (r.dest, r.origin) if r.product_type in SWAP_TYPES else (r.origin, r.dest)
+        if o and de and (o, de) not in rlist:
+            rlist.append((o, de))
+    prods = q("""SELECT i.product_code, i.product_name, COUNT(*) AS n
+                 FROM invoice_items i JOIN invoices v ON v.serial_no = i.serial_no
+                 WHERE v.created_by = :u AND v.invoice_date >= :s
+                 GROUP BY i.product_code, i.product_name ORDER BY n DESC LIMIT 30""", u=user_id, s=since)
+    plist = [f"{r.product_code} - {r.product_name}" for r in prods.itertuples()]
+    return rlist[:6], plist
 
 
 def search_products(labels, kw):
@@ -355,6 +396,8 @@ def account_menu():
         if st.session_state.get("token"):
             st.caption("자동 로그인 사용 중입니다. 지금 주소를 휴대폰 홈 화면에 추가하면 바로 열립니다. "
                        "이 주소는 다른 사람에게 보내지 마세요.")
+        st.radio("화면", ["자동", "휴대폰", "PC"], key="view_mode", horizontal=True,
+                 help="자동: 기기에 맞춰 화면을 바꿉니다.")
         if st.button("📲 바로가기 만들기", use_container_width=True):
             shortcut_dialog()
         if st.button("로그아웃", use_container_width=True):
@@ -525,6 +568,18 @@ def page_entry():
     if msg := ss.pop("code_msg", None):
         st.warning(msg)
 
+    fav_routes, fav_products = favorites(me().get("user_id"), inv_date)
+    if fav_routes:
+        def on_fav_route(key):
+            val = ss.get(key)
+            if val:
+                o, d = val.split(" → ")
+                ss.origin, ss.dest = (d, o) if ss.get("swapped") else (o, d)
+            ss.favr_ver = ss.get("favr_ver", 0) + 1  # 다음에 다시 누를 수 있게 선택 해제
+        rkey = f"favr_{ss.get('favr_ver', 0)}"
+        st.pills("자주 가는 행선지 (누르면 출발지·도착지 입력)", [f"{o} → {d}" for o, d in fav_routes],
+                 key=rkey, on_change=on_fav_route, args=(rkey,))
+
     swapped = ss.get("swapped", False)
     price_dest = origin if swapped else dest  # 단가는 원래(바뀌기 전) 도착지 기준
     if swapped and origin and dest:
@@ -541,6 +596,11 @@ def page_entry():
     addv = ss.setdefault("add_ver", 0)
 
     with st.container(border=True):
+        fav_labels = [l for l in fav_products if l in set(product_labels)][:8]
+        fav_pick = None
+        if fav_labels:
+            fav_pick = st.pills("자주 쓰는 제품", fav_labels, key=f"favp_{ver}_{addv}",
+                                format_func=lambda l: l.split(" - ", 1)[-1])
         kw = st.text_input("제품 검색", key=f"kw_{ver}_{addv}",
                            placeholder="예: 생맥주, 유흥, 캔, 테라 500 (띄어 쓰면 모두 포함된 제품)")
         if kw.strip():
@@ -556,6 +616,9 @@ def page_entry():
             if len(matches) > MAX_MATCHES:
                 st.caption(f"{len(matches)}개 중 {MAX_MATCHES}개만 보여 줍니다. 검색어를 더 입력하세요.")
             pick = st.radio("제품 선택", matches[:MAX_MATCHES], index=None, key=f"pick_{ver}_{addv}")
+        pick = pick or fav_pick
+        if pick:
+            st.info(f"선택: {pick}")
         c1, c2 = st.columns([2, 1])
         qty_new = c1.number_input("수량", min_value=0, step=1, value=None, key=f"qty_{ver}_{addv}")
         c2.write("")
@@ -837,42 +900,61 @@ def page_list():
     # 선택은 전표 단위: 한 줄만 체크해도 같은 전표의 모든 줄이 함께 체크된다
     ss = st.session_state
     chosen = [sn for sn in ss.get("sel_serials", []) if sn in set(items["serial_no"])]
-    view = pd.DataFrame({
-        "선택": items["serial_no"].isin(chosen),
-        "날짜": items["invoice_date"], "전표번호": items["slip_no"].fillna(""),
-        "출발지": items["origin"], "도착지": items["dest"], "제품명": items["product_name"],
-        "수량": items["qty"].map(lambda v: f"{v:,.0f}"),
-        "단가": items["unit_price"].map(lambda v: f"{v:,.2f}"),
-        "운반비": items["fee"].map(lambda v: f"{v:,.0f}"),
-        # 전표별 합계운반비: 전표의 첫 줄에만 표시
-        "전표 합계": pd.Series([f"{t:,.0f}" if first else "" for t, first in zip(
-            items.groupby("serial_no")["fee"].transform("sum"), ~items["serial_no"].duplicated())],
-            index=items.index),
-        "결제": items["paid_date"].fillna("").map(lambda d: f"✅ {d}" if d else "미결제"),
-        "일련번호": items["serial_no"],
-    })
-    if is_admin():
-        view["작성자"] = items["created_by"]
-    st.caption("맨 왼쪽 칸을 체크하면 같은 전표의 모든 품목이 함께 선택되고, 아래에 수정·삭제가 나타납니다.")
     ver = ss.setdefault("list_ver", 0)
-    edited = st.data_editor(
-        view, hide_index=True, use_container_width=True, key=f"item_table_{ver}",
-        disabled=[c for c in view.columns if c != "선택"],
-        column_config={"선택": st.column_config.CheckboxColumn("선택", width="small")},
-    )
-    flipped = edited.index[edited["선택"] != view["선택"]]
-    if len(flipped):
-        new_sel = list(chosen)
-        for i in flipped:
-            sn = items.at[i, "serial_no"]
-            if bool(edited.at[i, "선택"]) and sn not in new_sel:
+    if is_mobile():
+        # 휴대폰: 전표마다 카드 한 장, 체크하면 그 전표 전체 선택
+        st.caption("카드의 체크칸을 누르면 그 전표가 선택되고, 아래에 수정·삭제가 나타납니다.")
+        new_sel = []
+        for sn, g in items.groupby("serial_no", sort=False):
+            f = g.iloc[0]
+            with st.container(border=True):
+                checked = st.checkbox(f"**{f.invoice_date}** · {_s(f.slip_no) or '-'}  \n{f.origin} → {f.dest}",
+                                      value=sn in chosen, key=f"msel_{ver}_{sn}")
+                for r in g.itertuples():
+                    st.caption(f"{r.product_name} · {r.qty:,.0f} × {r.unit_price:,.2f} = {r.fee:,.0f}원")
+                paid = f"✅ {f.paid_date}" if isinstance(f.paid_date, str) and f.paid_date else "미결제"
+                st.markdown(f"**합계 {g['fee'].sum():,.0f}원** · {paid}"
+                            + (f" · {f.created_by}" if is_admin() else ""))
+            if checked:
                 new_sel.append(sn)
-            elif not bool(edited.at[i, "선택"]) and sn in new_sel:
-                new_sel.remove(sn)
-        ss.sel_serials = new_sel
-        ss.list_ver = ver + 1
-        st.rerun()
-
+        if new_sel != chosen:
+            ss.sel_serials = new_sel
+            chosen = new_sel
+    else:
+        view = pd.DataFrame({
+            "선택": items["serial_no"].isin(chosen),
+            "날짜": items["invoice_date"], "전표번호": items["slip_no"].fillna(""),
+            "출발지": items["origin"], "도착지": items["dest"], "제품명": items["product_name"],
+            "수량": items["qty"].map(lambda v: f"{v:,.0f}"),
+            "단가": items["unit_price"].map(lambda v: f"{v:,.2f}"),
+            "운반비": items["fee"].map(lambda v: f"{v:,.0f}"),
+            # 전표별 합계운반비: 전표의 첫 줄에만 표시
+            "전표 합계": pd.Series([f"{t:,.0f}" if first else "" for t, first in zip(
+                items.groupby("serial_no")["fee"].transform("sum"), ~items["serial_no"].duplicated())],
+                index=items.index),
+            "결제": items["paid_date"].fillna("").map(lambda d: f"✅ {d}" if d else "미결제"),
+            "일련번호": items["serial_no"],
+        })
+        if is_admin():
+            view["작성자"] = items["created_by"]
+        st.caption("맨 왼쪽 칸을 체크하면 같은 전표의 모든 품목이 함께 선택되고, 아래에 수정·삭제가 나타납니다.")
+        edited = st.data_editor(
+            view, hide_index=True, use_container_width=True, key=f"item_table_{ver}",
+            disabled=[c for c in view.columns if c != "선택"],
+            column_config={"선택": st.column_config.CheckboxColumn("선택", width="small")},
+        )
+        flipped = edited.index[edited["선택"] != view["선택"]]
+        if len(flipped):
+            new_sel = list(chosen)
+            for i in flipped:
+                sn = items.at[i, "serial_no"]
+                if bool(edited.at[i, "선택"]) and sn not in new_sel:
+                    new_sel.append(sn)
+                elif not bool(edited.at[i, "선택"]) and sn in new_sel:
+                    new_sel.remove(sn)
+            ss.sel_serials = new_sel
+            ss.list_ver = ver + 1
+            st.rerun()
     if chosen:
         sel = items[items["serial_no"].isin(chosen)]
         st.divider()
