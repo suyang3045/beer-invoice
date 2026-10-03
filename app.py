@@ -31,7 +31,9 @@ def today_kst():
     return now_kst().date()
 
 
-st.set_page_config(page_title="맥주 운송전표", page_icon="🍺", layout="wide", initial_sidebar_state="collapsed")
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")  # 바로가기·탭 아이콘
+st.set_page_config(page_title="맥주 운송전표", page_icon=ICON_PATH if os.path.exists(ICON_PATH) else "🍺",
+                   layout="wide", initial_sidebar_state="collapsed")
 
 # 앱 안쪽의 Streamlit 메뉴·장식 숨기기 (사이드바 열기 버튼은 남겨 둠)
 st.markdown("""
